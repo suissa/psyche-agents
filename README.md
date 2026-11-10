@@ -54,3 +54,14 @@ The GitHub Actions workflow runs the Python tests and compiles/tests the Zig sca
 Default policy allows no actions. Registering a tool does not authorize it. Financial actions require a policy allowlist, bounded positive amount, valid destination and currency, and a verifiable approval from a different actor. Unknown actions, unregistered tools, invalid approval and tool exceptions fail closed.
 
 This repository is an implementation foundation, not a certified financial control system. Before production use, connect durable audit storage, an authenticated approval service, idempotency and reconciliation, isolated candidate testing, secrets management, threat modeling and independent security review.
+
+
+## Governed Evolution Engine
+
+The implementation now binds each proposal to immutable candidate bytes stored by SHA-256. A validation report must attest to the exact artifact hash. Human approval is represented by a signed token bound to the proposal ID, artifact hash and validation ID; the engine rejects self-approval, expired tokens, replayed nonces and mismatched artifacts.
+
+Activation uses the registry generation captured when the proposal was created. A stale generation fails closed. The previous ToolBinding is retained and can be restored through a second compare-and-swap operation.
+
+The reference artifact store and approval nonce cache are in-memory implementations. Production deployments must replace them with durable immutable object storage and a shared, atomic replay-prevention store. The trusted approval gateway must authenticate the human before issuing an HMAC token.
+
+CandidateValidator is a trusted boundary: it must validate that the executable handler it has prepared corresponds to the exact candidate artifact supplied to it. The current engine swaps an already-loaded handler; it does not compile or execute generated source.

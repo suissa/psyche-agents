@@ -2,23 +2,30 @@ from __future__ import annotations
 
 import time
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 
 from psyche_agents import (
     DecisionStatus,
+    EvolutionaryEngine,
     HmacApprovalVerifier,
+    HmacEvolutionApprovalVerifier,
+    InMemoryArtifactStore,
     InMemoryAuditLog,
     Intent,
+    ProposalStatus,
     PsycheRuntime,
     SecurityPolicy,
     SideEffect,
     ToolManifest,
     ToolRegistry,
+    ValidationReport,
     sign_approval_token,
+    sign_evolution_approval,
 )
+from psyche_agents.artifacts import ArtifactRecord
 from psyche_agents.archetypes import Evidence, HeroAgent, RetryableOperationError, SageAgent
-from psyche_agents.evolution import EvolutionaryEngine, FailureSignal, ProposalStatus
-from psyche_agents.models import ValidationReport
+from psyche_agents.evolution import FailureSignal
 from psyche_agents.policy import SuperegoAgent
 from psyche_agents.registry import ToolBinding
 from psyche_agents.shadow import ShadowAgent
@@ -35,8 +42,21 @@ class EchoTool:
 
 
 class AlwaysPassValidator:
-    def validate(self, candidate: ToolBinding) -> ValidationReport:
-        return ValidationReport(True, ("unit", "contract", "security"))
+    def validate(self, candidate: ToolBinding, artifact: ArtifactRecord) -> ValidationReport:
+        return ValidationReport(
+            True,
+            ("unit", "contract", "security"),
+            artifact_sha256=artifact.sha256,
+        )
+
+
+class WrongArtifactValidator:
+    def validate(self, candidate: ToolBinding, artifact: ArtifactRecord) -> ValidationReport:
+        return ValidationReport(
+            True,
+            ("unit",),
+            artifact_sha256="0" * 64,
+        )
 
 
 def make_manifest(
@@ -54,6 +74,52 @@ def make_manifest(
         side_effects=side_effects,
         requires_approval=requires_approval,
     )
+
+
+EVOLUTION_SECRET = b"evolution-test-secret-at-least-32-bytes"
+
+
+def new_evolution_engine(
+    registry: ToolRegistry,
+    *,
+    clock=time.time,
+    audit: InMemoryAuditLog | None = None,
+) -> EvolutionaryEngine:
+    return EvolutionaryEngine(
+        registry,
+        approval_verifier=HmacEvolutionApprovalVerifier(
+            EVOLUTION_SECRET,
+            clock=clock,
+        ),
+        audit=audit,
+    )
+
+
+def create_validated_proposal(
+    engine: EvolutionaryEngine,
+    registry: ToolRegistry,
+    *,
+    action: str = "lookup",
+    version: str = "1.1.0",
+    artifact: bytes = b"immutable-candidate-v1",
+):
+    proposal = engine.propose(
+        ToolBinding(make_manifest(action, version=version), EchoTool()),
+        registry.generation,
+        artifact=artifact,
+        creator_id="magician-agent",
+    )
+    return engine.validate(proposal.proposal_id, AlwaysPassValidator())
+
+
+def approve_proposal(engine: EvolutionaryEngine, proposal):
+    approval = sign_evolution_approval(
+        EVOLUTION_SECRET,
+        proposal,
+        approver_id="release-approver",
+        expires_at=int(time.time()) + 120,
+    )
+    return engine.approve(proposal.proposal_id, approval)
 
 
 class PsycheRuntimeTests(unittest.TestCase):
@@ -256,48 +322,6 @@ class PsycheRuntimeTests(unittest.TestCase):
         self.assertEqual("invalid_amount", result.decision.code)
         self.assertEqual(0, handler.calls)
 
-    def test_registry_hot_swap_requires_validation_and_approval(self) -> None:
-        registry = ToolRegistry()
-        registry.register(ToolBinding(make_manifest(), EchoTool()))
-        generation = registry.generation
-        replacement = ToolBinding(make_manifest(version="1.1.0"), EchoTool())
-        engine = EvolutionaryEngine(registry)
-        proposal = engine.propose(replacement, generation)
-        validated = engine.validate(proposal.proposal_id, AlwaysPassValidator())
-        self.assertEqual(ProposalStatus.VALIDATED, validated.status)
-        approved = engine.approve(proposal.proposal_id, "release-approver")
-        self.assertEqual(ProposalStatus.APPROVED, approved.status)
-        activated = engine.activate(proposal.proposal_id)
-        self.assertEqual(ProposalStatus.ACTIVATED, activated.status)
-        self.assertEqual("1.1.0", registry.resolve("lookup").manifest.version)
-
-    def test_registry_hot_swap_rejects_stale_generation(self) -> None:
-        registry = ToolRegistry()
-        registry.register(ToolBinding(make_manifest(), EchoTool()))
-        engine = EvolutionaryEngine(registry)
-        proposal = engine.propose(
-            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
-            registry.generation,
-        )
-        engine.validate(proposal.proposal_id, AlwaysPassValidator())
-        engine.approve(proposal.proposal_id, "release-approver")
-        registry.register(ToolBinding(make_manifest("another"), EchoTool()))
-        with self.assertRaisesRegex(RuntimeError, "generation changed"):
-            engine.activate(proposal.proposal_id)
-
-    def test_failure_signal_can_create_candidate_but_not_activate_it(self) -> None:
-        registry = ToolRegistry()
-        registry.register(ToolBinding(make_manifest(), EchoTool()))
-        engine = EvolutionaryEngine(registry)
-        signal = FailureSignal("lookup", "handler_timeout", ("trace-1",), retryable=True)
-        proposal = engine.propose_from_failure(
-            signal,
-            lambda failure: ToolBinding(make_manifest(version="1.0.1"), EchoTool()),
-            registry.generation,
-        )
-        self.assertEqual(ProposalStatus.PROPOSED, proposal.status)
-        self.assertEqual("proposed", engine.get(proposal.proposal_id).status.value)
-
     def test_tool_exception_is_not_automatically_replayed(self) -> None:
         class BrokenTool:
             def __init__(self) -> None:
@@ -317,6 +341,308 @@ class PsycheRuntimeTests(unittest.TestCase):
         self.assertEqual(DecisionStatus.DENY, result.decision.status)
         self.assertEqual("tool_execution_failed", result.decision.code)
         self.assertEqual(1, handler.calls)
+
+
+class ArtifactAndEvolutionTests(unittest.TestCase):
+    def test_artifact_store_is_content_addressed_and_verifies_integrity(self) -> None:
+        store = InMemoryArtifactStore()
+        first = store.put(b"candidate bytes", "application/wasm")
+        second = store.put(b"candidate bytes", "application/wasm")
+        self.assertEqual(first.sha256, second.sha256)
+        self.assertEqual(first, store.get(first.sha256))
+        self.assertTrue(first.verify())
+        with self.assertRaises(ValueError):
+            store.put(b"")
+
+    def test_happy_path_requires_hash_bound_approval_and_activates(self) -> None:
+        registry = ToolRegistry()
+        original = ToolBinding(make_manifest(), EchoTool())
+        registry.register(original)
+        audit = InMemoryAuditLog()
+        engine = new_evolution_engine(registry, audit=audit)
+
+        validated = create_validated_proposal(engine, registry)
+        self.assertEqual(ProposalStatus.VALIDATED, validated.status)
+        self.assertEqual(validated.artifact.sha256, validated.validation.artifact_sha256)
+
+        token = sign_evolution_approval(
+            EVOLUTION_SECRET,
+            validated,
+            "release-approver",
+            int(time.time()) + 120,
+        )
+        approved = engine.approve(validated.proposal_id, token)
+        self.assertEqual(ProposalStatus.APPROVED, approved.status)
+        self.assertFalse(engine.approval_verifier.verify(engine.get(approved.proposal_id), token))
+        activated = engine.activate(approved.proposal_id)
+        self.assertEqual(ProposalStatus.ACTIVE, activated.status)
+        self.assertEqual("1.1.0", registry.resolve("lookup").manifest.version)
+        self.assertEqual(original, engine.get(approved.proposal_id).previous_binding)
+        self.assertTrue(
+            any(event.event_type == "evolution_state_transition" for event in audit.snapshot())
+        )
+
+    def test_activation_is_rejected_without_a_trusted_approval_verifier(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = EvolutionaryEngine(registry)
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate",
+            creator_id="magician-agent",
+        )
+        validated = engine.validate(proposal.proposal_id, AlwaysPassValidator())
+        with self.assertRaisesRegex(PermissionError, "no trusted"):
+            engine.approve(validated.proposal_id, replace(
+                sign_evolution_approval(
+                    EVOLUTION_SECRET,
+                    validated,
+                    "release-approver",
+                    int(time.time()) + 60,
+                ),
+                signature="not-a-signature",
+            ))
+        self.assertEqual(ProposalStatus.VALIDATED, engine.get(proposal.proposal_id).status)
+
+    def test_validator_must_attest_to_the_exact_candidate_hash(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate",
+        )
+        rejected = engine.validate(proposal.proposal_id, WrongArtifactValidator())
+        self.assertEqual(ProposalStatus.REJECTED, rejected.status)
+        self.assertIn("artifact hash", rejected.validation.failures[0])
+        with self.assertRaises(RuntimeError):
+            engine.activate(proposal.proposal_id)
+
+    def test_invalid_or_tampered_approval_does_not_authorize_candidate(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        validated = create_validated_proposal(engine, registry)
+        valid = sign_evolution_approval(
+            EVOLUTION_SECRET,
+            validated,
+            "release-approver",
+            int(time.time()) + 60,
+        )
+        tampered = replace(valid, artifact_sha256="f" * 64)
+        with self.assertRaisesRegex(PermissionError, "bound to different"):
+            engine.approve(validated.proposal_id, tampered)
+        self.assertEqual(
+            ProposalStatus.AWAITING_APPROVAL,
+            engine.get(validated.proposal_id).status,
+        )
+        approved = engine.approve(
+            validated.proposal_id,
+            sign_evolution_approval(
+                EVOLUTION_SECRET,
+                engine.get(validated.proposal_id),
+                "release-approver",
+                int(time.time()) + 60,
+            ),
+        )
+        self.assertEqual(ProposalStatus.APPROVED, approved.status)
+
+    def test_approval_cannot_be_reused_for_another_proposal_or_artifact(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        first = create_validated_proposal(
+            engine, registry, artifact=b"candidate-one", version="1.1.0"
+        )
+        second = create_validated_proposal(
+            engine, registry, artifact=b"candidate-two", version="1.2.0"
+        )
+        token = sign_evolution_approval(
+            EVOLUTION_SECRET, first, "release-approver", int(time.time()) + 60
+        )
+        with self.assertRaises(PermissionError):
+            engine.approve(second.proposal_id, token)
+        self.assertEqual(
+            ProposalStatus.AWAITING_APPROVAL,
+            engine.get(second.proposal_id).status,
+        )
+
+    def test_self_approval_is_rejected(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate",
+            creator_id="same-person",
+        )
+        validated = engine.validate(proposal.proposal_id, AlwaysPassValidator())
+        with self.assertRaisesRegex(ValueError, "independent"):
+            sign_evolution_approval(
+                EVOLUTION_SECRET,
+                validated,
+                "same-person",
+                int(time.time()) + 60,
+            )
+
+    def test_expired_approval_is_rejected(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry, clock=lambda: 500.0)
+        validated = create_validated_proposal(engine, registry)
+        approval = sign_evolution_approval(
+            EVOLUTION_SECRET,
+            validated,
+            "release-approver",
+            499,
+            issued_at=400,
+        )
+        with self.assertRaises(PermissionError):
+            engine.approve(validated.proposal_id, approval)
+
+    def test_successful_rollback_restores_previous_binding(self) -> None:
+        registry = ToolRegistry()
+        original = ToolBinding(make_manifest(), EchoTool())
+        registry.register(original)
+        engine = new_evolution_engine(registry)
+        validated = create_validated_proposal(engine, registry)
+        approved = approve_proposal(engine, validated)
+        active = engine.activate(approved.proposal_id)
+        self.assertEqual("1.1.0", registry.resolve("lookup").manifest.version)
+
+        rolled_back = engine.rollback(active.proposal_id)
+        self.assertEqual(ProposalStatus.ROLLED_BACK, rolled_back.status)
+        self.assertEqual("1.0.0", registry.resolve("lookup").manifest.version)
+
+    def test_activation_rejects_stale_registry_generation(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        validated = create_validated_proposal(engine, registry)
+        approved = approve_proposal(engine, validated)
+        registry.register(ToolBinding(make_manifest("another"), EchoTool()))
+        with self.assertRaisesRegex(RuntimeError, "generation changed"):
+            engine.activate(approved.proposal_id)
+        self.assertEqual(ProposalStatus.FAILED, engine.get(approved.proposal_id).status)
+        self.assertEqual("1.0.0", registry.resolve("lookup").manifest.version)
+
+    def test_rollback_refuses_to_overwrite_a_newer_registry_change(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        validated = create_validated_proposal(engine, registry)
+        approved = approve_proposal(engine, validated)
+        active = engine.activate(approved.proposal_id)
+        registry.register(ToolBinding(make_manifest("newer-action"), EchoTool()))
+
+        with self.assertRaisesRegex(RuntimeError, "generation changed"):
+            engine.rollback(active.proposal_id)
+        self.assertEqual(ProposalStatus.FAILED, engine.get(active.proposal_id).status)
+        self.assertEqual("1.1.0", registry.resolve("lookup").manifest.version)
+        self.assertIsNotNone(registry.resolve("newer-action"))
+
+    def test_rejection_and_request_changes_are_explicit_terminal_decisions(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+
+        first = create_validated_proposal(engine, registry, artifact=b"needs-changes")
+        changed = engine.request_changes(
+            first.proposal_id,
+            "reviewer-1",
+            "Add a missing integration test and resubmit a new candidate.",
+        )
+        self.assertEqual(ProposalStatus.CHANGES_REQUESTED, changed.status)
+        with self.assertRaises(RuntimeError):
+            engine.activate(first.proposal_id)
+
+        second = create_validated_proposal(
+            engine, registry, artifact=b"rejected-candidate", version="1.2.0"
+        )
+        rejected = engine.reject(
+            second.proposal_id,
+            "security-reviewer",
+            "The candidate violates the security contract.",
+        )
+        self.assertEqual(ProposalStatus.REJECTED, rejected.status)
+        with self.assertRaises(RuntimeError):
+            engine.approve(
+                second.proposal_id,
+                sign_evolution_approval(
+                    EVOLUTION_SECRET,
+                    second,
+                    "release-approver",
+                    int(time.time()) + 60,
+                ),
+            )
+
+    def test_artifact_tampering_before_validation_marks_proposal_failed(self) -> None:
+        class TamperedStore(InMemoryArtifactStore):
+            def get(self, sha256: str) -> ArtifactRecord:
+                record = super().get(sha256)
+                return replace(record, content=b"tampered candidate")
+
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = EvolutionaryEngine(
+            registry,
+            artifact_store=TamperedStore(),
+            approval_verifier=HmacEvolutionApprovalVerifier(EVOLUTION_SECRET),
+        )
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"original candidate",
+        )
+        with self.assertRaisesRegex(RuntimeError, "integrity"):
+            engine.validate(proposal.proposal_id, AlwaysPassValidator())
+        self.assertEqual(ProposalStatus.FAILED, engine.get(proposal.proposal_id).status)
+
+    def test_validator_exception_marks_proposal_failed(self) -> None:
+        class BrokenValidator:
+            def validate(self, candidate: ToolBinding, artifact: ArtifactRecord) -> ValidationReport:
+                raise RuntimeError("sandbox unavailable")
+
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate",
+        )
+        with self.assertRaisesRegex(RuntimeError, "sandbox unavailable"):
+            engine.validate(proposal.proposal_id, BrokenValidator())
+        self.assertEqual(ProposalStatus.FAILED, engine.get(proposal.proposal_id).status)
+
+    def test_failure_signal_can_create_candidate_but_not_activate_it(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        signal = FailureSignal("lookup", "handler_timeout", ("trace-1",), retryable=True)
+        proposal = engine.propose_from_failure(
+            signal,
+            lambda failure: ToolBinding(make_manifest(version="1.0.1"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate-from-failure",
+        )
+        self.assertEqual(ProposalStatus.PROPOSED, proposal.status)
+        self.assertEqual("1.0.0", registry.resolve("lookup").manifest.version)
+
+    def test_invalid_state_transition_is_refused(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate",
+        )
+        with self.assertRaises(RuntimeError):
+            engine.activate(proposal.proposal_id)
 
 
 class GuardAndArchetypeTests(unittest.TestCase):

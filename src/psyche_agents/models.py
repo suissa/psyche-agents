@@ -81,3 +81,5 @@ class ValidationReport:
     passed: bool
     checks: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
+    artifact_sha256: str | None = None
+    validation_id: str = field(default_factory=lambda: uuid4().hex)
