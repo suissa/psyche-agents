@@ -2,3 +2,12 @@
 zig-out/
 zig-pkg/
 *.o
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.coverage
