@@ -597,7 +597,7 @@ class ArtifactAndEvolutionTests(unittest.TestCase):
             registry.generation,
             artifact=b"original candidate",
         )
-        with self.assertRaisesRegex(RuntimeError, "integrity"):
+        with self.assertRaisesRegex(RuntimeError, "candidate artifact changed"):
             engine.validate(proposal.proposal_id, AlwaysPassValidator())
         self.assertEqual(ProposalStatus.FAILED, engine.get(proposal.proposal_id).status)
 
