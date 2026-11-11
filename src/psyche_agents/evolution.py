@@ -14,7 +14,8 @@ from .artifacts import ArtifactRecord, ArtifactStore, InMemoryArtifactStore
 from .audit import AuditSink, InMemoryAuditLog
 from .models import AuditEvent, ValidationReport
 from .registry import ToolBinding, ToolRegistry
-from .loader import ArtifactLoader, PreparedArtifactLoader
+from .loader import ArtifactLoader, PreparedArtifactLoader, TrustedBindingResolver
+from .persistence import EvolutionProposalStore, manifest_from_dict, manifest_to_dict
 from .replay import InMemoryNonceStore, NonceStore
 
 
@@ -68,6 +69,9 @@ class EvolutionProposal:
     validation: ValidationReport | None = None
     approver_id: str | None = None
     approval_nonce: str | None = None
+    approval_issued_at: int | None = None
+    approval_expires_at: int | None = None
+    approval_signature: str | None = None
     activation_generation: int | None = None
 
 
@@ -81,6 +85,8 @@ class EvolutionApprovalVerifier(Protocol):
     def verify(
         self, proposal: EvolutionProposal, approval: EvolutionApproval
     ) -> bool: ...
+
+    def verify_recorded(self, proposal: EvolutionProposal) -> bool: ...
 
 
 def _approval_payload(approval: EvolutionApproval) -> bytes:
@@ -189,6 +195,45 @@ class HmacEvolutionApprovalVerifier:
             return False
         return self._nonce_store.consume(approval.nonce, approval.expires_at, now)
 
+    def verify_recorded(self, proposal: EvolutionProposal) -> bool:
+        """Verify durable approval evidence without consuming its nonce a second time."""
+        report = proposal.validation
+        if (
+            report is None
+            or not report.passed
+            or report.artifact_sha256 != proposal.artifact.sha256
+            or not isinstance(report.validation_id, str)
+            or not report.validation_id.strip()
+            or not proposal.approver_id
+            or proposal.approver_id == proposal.created_by
+            or not proposal.approval_nonce
+            or proposal.approval_issued_at is None
+            or proposal.approval_expires_at is None
+            or not proposal.approval_signature
+        ):
+            return False
+        if (
+            proposal.approval_issued_at < 0
+            or proposal.approval_expires_at <= proposal.approval_issued_at
+            or proposal.approval_expires_at - proposal.approval_issued_at
+            > self._max_lifetime
+        ):
+            return False
+        approval = EvolutionApproval(
+            proposal_id=proposal.proposal_id,
+            artifact_sha256=proposal.artifact.sha256,
+            validation_id=report.validation_id,
+            approver_id=proposal.approver_id,
+            issued_at=proposal.approval_issued_at,
+            expires_at=proposal.approval_expires_at,
+            nonce=proposal.approval_nonce,
+            signature=proposal.approval_signature,
+        )
+        expected = hmac.new(
+            self._secret, _approval_payload(approval), hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected, approval.signature)
+
 
 class EvolutionaryEngine:
     """Governed evolution controller for already-loaded capability handlers.
@@ -219,11 +264,11 @@ class EvolutionaryEngine:
             ProposalStatus.ACTIVATING, ProposalStatus.REJECTED
         }),
         ProposalStatus.ACTIVATING: frozenset({
-            ProposalStatus.ACTIVE, ProposalStatus.FAILED
+            ProposalStatus.ACTIVE, ProposalStatus.APPROVED, ProposalStatus.FAILED
         }),
         ProposalStatus.ACTIVE: frozenset({ProposalStatus.ROLLING_BACK}),
         ProposalStatus.ROLLING_BACK: frozenset({
-            ProposalStatus.ROLLED_BACK, ProposalStatus.FAILED
+            ProposalStatus.ROLLED_BACK, ProposalStatus.ACTIVE, ProposalStatus.FAILED
         }),
     }
 
@@ -235,14 +280,21 @@ class EvolutionaryEngine:
         approval_verifier: EvolutionApprovalVerifier | None = None,
         artifact_loader: ArtifactLoader | None = None,
         audit: AuditSink | None = None,
+        proposal_store: EvolutionProposalStore | None = None,
+        binding_resolver: TrustedBindingResolver | None = None,
     ) -> None:
         self.registry = registry
         self.artifact_store = artifact_store or InMemoryArtifactStore()
         self.artifact_loader = artifact_loader or PreparedArtifactLoader(self.artifact_store)
         self.approval_verifier = approval_verifier
         self.audit = audit or InMemoryAuditLog()
+        self.proposal_store = proposal_store
+        self.binding_resolver = binding_resolver
         self._proposals: dict[str, EvolutionProposal] = {}
+        self._revisions: dict[str, int] = {}
         self._lock = RLock()
+        if self.proposal_store is not None:
+            self._restore_persisted_proposals()
 
     def propose(
         self,
@@ -282,6 +334,7 @@ class EvolutionaryEngine:
             created_by=creator_id,
         )
         with self._lock:
+            self._persist_proposal(proposal, creating=True)
             self._proposals[proposal.proposal_id] = proposal
         self._record(proposal, "proposal_created", status=proposal.status.value)
         return proposal
@@ -344,7 +397,6 @@ class EvolutionaryEngine:
             current = self._proposals[proposal_id]
             next_status = ProposalStatus.VALIDATED if passed else ProposalStatus.REJECTED
             updated = replace(current, validation=report)
-            self._proposals[proposal_id] = updated
             return self._transition(updated, next_status)
 
     def reject(
@@ -415,8 +467,10 @@ class EvolutionaryEngine:
                 proposal,
                 approver_id=approval.approver_id,
                 approval_nonce=approval.nonce,
+                approval_issued_at=approval.issued_at,
+                approval_expires_at=approval.expires_at,
+                approval_signature=approval.signature,
             )
-            self._proposals[proposal_id] = updated
             return self._transition(updated, ProposalStatus.APPROVED)
 
     def activate(self, proposal_id: str) -> EvolutionProposal:
@@ -447,7 +501,6 @@ class EvolutionaryEngine:
         with self._lock:
             current = self._proposals[proposal_id]
             updated = replace(current, activation_generation=new_generation)
-            self._proposals[proposal_id] = updated
             return self._transition(updated, ProposalStatus.ACTIVE)
 
     def rollback(self, proposal_id: str) -> EvolutionProposal:
@@ -473,12 +526,323 @@ class EvolutionaryEngine:
         with self._lock:
             current = self._proposals[proposal_id]
             updated = replace(current, activation_generation=restored_generation)
-            self._proposals[proposal_id] = updated
             return self._transition(updated, ProposalStatus.ROLLED_BACK)
 
     def get(self, proposal_id: str) -> EvolutionProposal:
         with self._lock:
             return self._proposals[proposal_id]
+
+    def list(self) -> tuple[EvolutionProposal, ...]:
+        with self._lock:
+            return tuple(self._proposals[key] for key in sorted(self._proposals))
+
+    def _proposal_payload(self, proposal: EvolutionProposal) -> dict[str, object]:
+        validation = None
+        if proposal.validation is not None:
+            validation = {
+                "passed": proposal.validation.passed,
+                "checks": list(proposal.validation.checks),
+                "failures": list(proposal.validation.failures),
+                "artifact_sha256": proposal.validation.artifact_sha256,
+                "validation_id": proposal.validation.validation_id,
+            }
+        return {
+            "proposal_id": proposal.proposal_id,
+            "replacement_manifest": manifest_to_dict(proposal.replacement.manifest),
+            "previous_manifest": manifest_to_dict(proposal.previous_binding.manifest),
+            "artifact_sha256": proposal.artifact.sha256,
+            "artifact_size_bytes": proposal.artifact.size_bytes,
+            "artifact_media_type": proposal.artifact.media_type,
+            "expected_generation": proposal.expected_generation,
+            "created_by": proposal.created_by,
+            "status": proposal.status.value,
+            "validation": validation,
+            "approver_id": proposal.approver_id,
+            "approval_nonce": proposal.approval_nonce,
+            "approval_issued_at": proposal.approval_issued_at,
+            "approval_expires_at": proposal.approval_expires_at,
+            "approval_signature": proposal.approval_signature,
+            "activation_generation": proposal.activation_generation,
+        }
+
+    def _persist_proposal(
+        self,
+        proposal: EvolutionProposal,
+        *,
+        creating: bool = False,
+    ) -> None:
+        if self.proposal_store is None:
+            return
+        expected_revision = None if creating else self._revisions.get(proposal.proposal_id)
+        if not creating and expected_revision is None:
+            raise RuntimeError("proposal revision is missing from durable state")
+        revision = self.proposal_store.save(
+            proposal.proposal_id,
+            self._proposal_payload(proposal),
+            expected_revision=expected_revision,
+        )
+        self._revisions[proposal.proposal_id] = revision
+
+    def _resolve_binding(self, manifest, *, artifact: ArtifactRecord | None = None) -> ToolBinding:
+        if artifact is not None:
+            try:
+                binding = self.artifact_loader.load(artifact.sha256)
+            except KeyError:
+                if self.binding_resolver is None:
+                    raise RuntimeError(
+                        "candidate handler is not loaded; configure a trusted binding resolver"
+                    )
+                binding = self.binding_resolver.resolve(manifest)
+                if not isinstance(binding, ToolBinding) or binding.manifest != manifest:
+                    raise RuntimeError("trusted resolver returned a mismatched candidate handler")
+                self.artifact_loader.stage(artifact, binding)
+                binding = self.artifact_loader.load(artifact.sha256)
+        else:
+            current = self.registry.resolve(manifest.action)
+            if current is not None and current.manifest == manifest:
+                return current
+            if self.binding_resolver is None:
+                raise RuntimeError(
+                    f"previous handler {manifest.action}@{manifest.version} is not registered; "
+                    "configure a trusted binding resolver"
+                )
+            binding = self.binding_resolver.resolve(manifest)
+        if not isinstance(binding, ToolBinding) or binding.manifest != manifest:
+            raise RuntimeError("trusted binding resolver returned a mismatched manifest")
+        return binding
+
+    def _hydrate_proposal(
+        self,
+        proposal_id: str,
+        payload: dict[str, object],
+    ) -> EvolutionProposal:
+        if payload.get("proposal_id") != proposal_id:
+            raise RuntimeError("persisted proposal ID does not match its storage key")
+        try:
+            replacement_manifest = manifest_from_dict(payload["replacement_manifest"])
+            previous_manifest = manifest_from_dict(payload["previous_manifest"])
+            artifact_sha256 = payload["artifact_sha256"]
+            artifact_size = payload["artifact_size_bytes"]
+            media_type = payload["artifact_media_type"]
+            expected_generation = payload["expected_generation"]
+            creator_id = payload["created_by"]
+            status = ProposalStatus(payload["status"])
+            approver_id = payload["approver_id"]
+            approval_nonce = payload["approval_nonce"]
+            approval_issued_at = payload.get("approval_issued_at")
+            approval_expires_at = payload.get("approval_expires_at")
+            approval_signature = payload.get("approval_signature")
+            activation_generation = payload["activation_generation"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"persisted proposal metadata is invalid: {proposal_id}") from error
+        if (
+            not isinstance(artifact_sha256, str)
+            or not isinstance(artifact_size, int)
+            or not isinstance(media_type, str)
+            or not media_type.strip()
+            or not isinstance(expected_generation, int)
+            or expected_generation < 0
+            or not isinstance(creator_id, str)
+            or not creator_id.strip()
+            or (approver_id is not None and not isinstance(approver_id, str))
+            or (approval_nonce is not None and not isinstance(approval_nonce, str))
+            or (approval_issued_at is not None and not isinstance(approval_issued_at, int))
+            or (approval_expires_at is not None and not isinstance(approval_expires_at, int))
+            or (approval_signature is not None and not isinstance(approval_signature, str))
+            or (activation_generation is not None and not isinstance(activation_generation, int))
+        ):
+            raise RuntimeError(f"persisted proposal fields are invalid: {proposal_id}")
+        artifact = self.artifact_store.get(artifact_sha256)
+        if (
+            not artifact.verify()
+            or artifact.size_bytes != artifact_size
+            or artifact.media_type != media_type
+        ):
+            raise RuntimeError(f"persisted proposal artifact does not match its metadata: {proposal_id}")
+        replacement = self._resolve_binding(replacement_manifest, artifact=artifact)
+        previous = self._resolve_binding(previous_manifest)
+        if replacement.manifest.action != previous.manifest.action:
+            raise RuntimeError("persisted proposal handlers do not share the same action")
+        validation_payload = payload.get("validation")
+        validation = None
+        if validation_payload is not None:
+            if not isinstance(validation_payload, dict):
+                raise RuntimeError("persisted validation report must be an object")
+            try:
+                passed = validation_payload["passed"]
+                checks = validation_payload["checks"]
+                failures = validation_payload["failures"]
+                validation_hash = validation_payload["artifact_sha256"]
+                validation_id = validation_payload["validation_id"]
+                if (
+                    not isinstance(passed, bool)
+                    or not isinstance(checks, list)
+                    or not all(isinstance(item, str) for item in checks)
+                    or not isinstance(failures, list)
+                    or not all(isinstance(item, str) for item in failures)
+                    or (validation_hash is not None and not isinstance(validation_hash, str))
+                    or not isinstance(validation_id, str)
+                    or not validation_id.strip()
+                ):
+                    raise ValueError("validation report fields are invalid")
+                validation = ValidationReport(
+                    passed=passed,
+                    checks=tuple(checks),
+                    failures=tuple(failures),
+                    artifact_sha256=validation_hash,
+                    validation_id=validation_id,
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise RuntimeError(f"persisted validation report is invalid: {proposal_id}") from error
+        if validation is not None and validation.passed:
+            if validation.artifact_sha256 != artifact.sha256:
+                raise RuntimeError("persisted passing validation references another artifact")
+        approval_required_statuses = {
+            ProposalStatus.APPROVED,
+            ProposalStatus.ACTIVATING,
+            ProposalStatus.ACTIVE,
+            ProposalStatus.ROLLING_BACK,
+            ProposalStatus.ROLLED_BACK,
+        }
+        if status in approval_required_statuses and (
+            validation is None
+            or not validation.passed
+            or validation.artifact_sha256 != artifact.sha256
+            or not approver_id
+            or not approval_nonce
+            or approval_issued_at is None
+            or approval_expires_at is None
+            or not approval_signature
+        ):
+            raise RuntimeError("persisted approved proposal is missing its signed approval evidence")
+        if status is ProposalStatus.VALIDATED and (
+            validation is None or not validation.passed
+        ):
+            raise RuntimeError("persisted validated proposal has no passing validation report")
+
+        proposal = EvolutionProposal(
+            proposal_id=proposal_id,
+            replacement=replacement,
+            previous_binding=previous,
+            artifact=artifact,
+            expected_generation=expected_generation,
+            created_by=creator_id,
+            status=status,
+            validation=validation,
+            approver_id=approver_id,
+            approval_nonce=approval_nonce,
+            approval_issued_at=approval_issued_at,
+            approval_expires_at=approval_expires_at,
+            approval_signature=approval_signature,
+            activation_generation=activation_generation,
+        )
+        if status in approval_required_statuses:
+            verifier = self.approval_verifier
+            verify_recorded = getattr(verifier, "verify_recorded", None)
+            if not callable(verify_recorded) or not verify_recorded(proposal):
+                raise RuntimeError("persisted human approval signature failed verification")
+        return proposal
+
+    def _same_active_binding(self, expected: ToolBinding, actual: ToolBinding | None) -> bool:
+        return (
+            actual is expected
+            or (
+                actual is not None
+                and actual.manifest == expected.manifest
+                and actual.handler is expected.handler
+            )
+        )
+
+    def _restore_persisted_proposals(self) -> None:
+        assert self.proposal_store is not None
+        for proposal_id, payload, revision in self.proposal_store.load_all():
+            proposal = self._hydrate_proposal(proposal_id, payload)
+            self._proposals[proposal_id] = proposal
+            self._revisions[proposal_id] = revision
+            self._recover_interrupted_proposal(proposal)
+
+    def _recover_interrupted_proposal(self, proposal: EvolutionProposal) -> None:
+        current = self.registry.resolve(proposal.replacement.manifest.action)
+        if proposal.status is ProposalStatus.VALIDATING:
+            self._transition(
+                proposal,
+                ProposalStatus.FAILED,
+                recovery="validation_interrupted_by_process_restart",
+            )
+            return
+        if proposal.status is ProposalStatus.ACTIVATING:
+            if self._same_active_binding(proposal.replacement, current):
+                recovered = replace(proposal, activation_generation=self.registry.generation)
+                self._transition(
+                    recovered,
+                    ProposalStatus.ACTIVE,
+                    recovery="activation_observed_during_restart",
+                )
+            elif self._same_active_binding(proposal.previous_binding, current):
+                recovered = replace(proposal, expected_generation=self.registry.generation)
+                self._transition(
+                    recovered,
+                    ProposalStatus.APPROVED,
+                    recovery="activation_not_committed_before_restart",
+                )
+            else:
+                self._transition(
+                    proposal,
+                    ProposalStatus.FAILED,
+                    recovery="activation_state_could_not_be_reconciled",
+                )
+            return
+        if proposal.status is ProposalStatus.ROLLING_BACK:
+            if self._same_active_binding(proposal.previous_binding, current):
+                recovered = replace(proposal, activation_generation=self.registry.generation)
+                self._transition(
+                    recovered,
+                    ProposalStatus.ROLLED_BACK,
+                    recovery="rollback_observed_during_restart",
+                )
+            elif self._same_active_binding(proposal.replacement, current):
+                recovered = replace(proposal, activation_generation=self.registry.generation)
+                self._transition(
+                    recovered,
+                    ProposalStatus.ACTIVE,
+                    recovery="rollback_not_committed_before_restart",
+                )
+            else:
+                self._transition(
+                    proposal,
+                    ProposalStatus.FAILED,
+                    recovery="rollback_state_could_not_be_reconciled",
+                )
+            return
+        if proposal.status in {
+            ProposalStatus.PROPOSED,
+            ProposalStatus.VALIDATED,
+            ProposalStatus.AWAITING_APPROVAL,
+            ProposalStatus.APPROVED,
+        } and self._same_active_binding(proposal.previous_binding, current):
+            if proposal.expected_generation != self.registry.generation:
+                recovered = replace(proposal, expected_generation=self.registry.generation)
+                self._persist_proposal(recovered)
+                self._proposals[proposal.proposal_id] = recovered
+                self._record(
+                    recovered,
+                    "proposal_rehydrated",
+                    registry_generation=self.registry.generation,
+                    rebased_expected_generation=True,
+                )
+            return
+        if proposal.status is ProposalStatus.ACTIVE and self._same_active_binding(
+            proposal.replacement, current
+        ):
+            if proposal.activation_generation != self.registry.generation:
+                recovered = replace(proposal, activation_generation=self.registry.generation)
+                self._persist_proposal(recovered)
+                self._proposals[proposal.proposal_id] = recovered
+                self._record(
+                    recovered,
+                    "proposal_rehydrated",
+                    registry_generation=self.registry.generation,
+                )
 
     def _require(
         self, proposal_id: str, expected_status: ProposalStatus
@@ -500,15 +864,16 @@ class EvolutionaryEngine:
             raise RuntimeError(
                 f"invalid evolution transition: {proposal.status.value} -> {target.value}"
             )
+        updated = replace(proposal, status=target)
+        self._persist_proposal(updated)
+        self._proposals[proposal.proposal_id] = updated
         self._record(
-            proposal,
+            updated,
             "evolution_state_transition",
             previous_status=proposal.status.value,
             new_status=target.value,
             **details,
         )
-        updated = replace(proposal, status=target)
-        self._proposals[proposal.proposal_id] = updated
         return updated
 
     def _record(self, proposal: EvolutionProposal, event_type: str, **details: object) -> None:

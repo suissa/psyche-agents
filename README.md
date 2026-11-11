@@ -102,7 +102,7 @@ Example configuration:
 
 The GitHub Actions workflow builds a small local validator fixture and runs an actual container integration test that verifies candidate readability, read-only root filesystem, zero Linux capabilities, no-new-privileges and disabled networking.
 
-SQLite stores are intended for a local durable filesystem. Multi-host production should inject object storage, a shared transactional nonce store and a server-backed release coordinator. Evolution proposal state and the prepared-handler catalog remain in memory; the default audit sink remains in-memory unless `SQLiteAuditLog` is supplied. Multi-host distributed activation is not implemented yet.
+SQLite stores are intended for a local durable filesystem. Multi-host production should inject object storage, a shared transactional nonce store and a server-backed release coordinator. Evolution proposal metadata can be persisted with `SQLiteEvolutionProposalStore`, and prepared digest-to-manifest metadata with `SQLitePreparedArtifactCatalog`; runtime handler objects are still rehydrated from a trusted application resolver. The default audit sink remains in-memory unless `SQLiteAuditLog` is supplied. Multi-host distributed activation is not implemented yet.
 
 
 ## Durable evolution history and release coordination
@@ -112,3 +112,10 @@ SQLite stores are intended for a local durable filesystem. Multi-host production
 `ReleaseCoordinator` defines the release boundary. Its `SQLiteReleaseCoordinator` implementation provides per-target leases, monotonic fencing tokens, generation CAS, idempotent retries and a transactionally written release event chain. This implementation coordinates multiple processes on one host using a durable local filesystem. A multi-host deployment needs a server-backed adapter implementing the same protocol; SQLite on a shared network filesystem is not a distributed lock service.
 
 The release coordinator records deployment metadata only. It does not build, sign, upload or deploy executable artifacts, and it does not turn the engine's in-process registry swap into a distributed rollout. Those steps remain explicit trusted integration boundaries.
+
+
+## Durable proposal recovery
+
+`SQLiteEvolutionProposalStore` saves proposal status, validation evidence, signed-approval metadata and activation generation with optimistic revision checks. `SQLitePreparedArtifactCatalog` stores only candidate digest-to-manifest metadata. At restart, the host supplies a `TrustedBindingResolver` that maps each persisted manifest to an already-prepared handler. Recovery rejects missing or mismatched handlers and reconciles interrupted lifecycle transitions against the current trusted registry.
+
+The database does not serialize executable handlers and does not decide which binary is deployed. The host bootstrap/release layer must register the active trusted version before constructing `EvolutionaryEngine`, provide a `TrustedBindingResolver`, and configure the same approval verifier so persisted approval signatures can be checked after restart. The SQLite stores are scoped to a durable local filesystem and multiple local processes; multi-host deployments need server-backed implementations.

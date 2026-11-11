@@ -44,7 +44,7 @@ The container runner's image and commands are trusted deployment configuration. 
 
 PreparedArtifactLoader maps a verified artifact digest to a ToolBinding that has already been prepared by trusted application/build code. On activation, the engine resolves the exact approved digest and checks that the loaded manifest equals the candidate manifest before replacing the active registry binding.
 
-The loader never imports, evaluates or executes artifact bytes. A production build pipeline must verify provenance and prepare the handler in a trusted process before staging it. The current loader catalog is in-memory; a process restart requires the release/bootstrap layer to re-register its trusted prepared handlers.
+The loader never imports, evaluates or executes artifact bytes. A production build pipeline must verify provenance and prepare the handler in a trusted process before staging it. The runtime handler map is in-memory; an optional SQLitePreparedArtifactCatalog persists only digest-to-manifest metadata. A process restart still requires the release/bootstrap layer to supply the already-prepared handler through TrustedBindingResolver.
 
 ## Human approval and replay protection
 
@@ -70,7 +70,7 @@ The monitor does not collect telemetry itself. Production must connect an observ
 
 ## Audit and persistence boundaries
 
-The ArtifactStore and optional nonce store have SQLite implementations. Evolution proposal state, prepared handler catalog and default audit sink are still in memory. Production must add durable proposal state, tamper-evident audit storage and transactional coordination between registry changes and audit persistence.
+Artifact bytes, approval nonces, proposal metadata, prepared-artifact metadata and audit events now have opt-in SQLite implementations. The default adapters remain in-memory. The SQLite adapters coordinate multiple processes on one host and a durable local filesystem; multi-host production needs server-backed stores. The proposal store uses optimistic revisions to reject stale writes. Audit and proposal state currently live in separate stores, so deployment must monitor and reconcile a failure between those writes.
 
 ## Deliberate boundaries
 
@@ -124,3 +124,44 @@ A fencing token prevents a worker whose lease expired or was superseded from com
 **Deployment boundary:** this SQLite coordinator supports multiple processes sharing one durable local database and filesystem. It is not a multi-host consensus system, and SQLite over NFS or an unreliable network filesystem is not supported. Multi-host deployment must provide a server-backed implementation of `ReleaseCoordinator` with transactional lease/fencing and generation-CAS semantics. The `EvolutionaryEngine` still performs an in-process `ToolRegistry` swap; an application release adapter must connect the coordinator to its actual deployment/routing system. It must not treat a coordinator record as proof that code was built, signed or deployed.
 
 Proposal history can be made durable immediately by injecting `SQLiteAuditLog`; prepared handlers and active in-process bindings still need a trusted bootstrap/catalog on restart. The audit log is a durable event history, not a serializer for Python handler objects.
+
+
+## Durable proposal recovery and trusted handler rehydration
+
+`SQLiteEvolutionProposalStore` persists proposal metadata, validation results, approval evidence, lifecycle status and activation generation. Every update increments a revision and uses compare-and-swap; a process with stale proposal state cannot silently overwrite a newer transition. Candidate bytes remain in `ArtifactStore` and are referenced by SHA-256. Handler objects, Python modules and executable code are never serialized.
+
+`SQLitePreparedArtifactCatalog` persists only the association between an artifact digest and its expected `ToolManifest`. At process startup, `PreparedArtifactLoader.restore_catalog(resolver)` asks a host-supplied `TrustedBindingResolver` for an already-prepared handler. The loader verifies that the returned manifest is an exact match and that the referenced artifact still exists and passes its digest check. A resolver mismatch, missing artifact or missing trusted handler prevents recovery.
+
+Example bootstrap:
+
+```python
+artifacts = SQLiteArtifactStore("./var/artifacts.sqlite3")
+proposal_store = SQLiteEvolutionProposalStore("./var/proposals.sqlite3")
+prepared_catalog = SQLitePreparedArtifactCatalog("./var/prepared.sqlite3")
+
+# The application constructs these handlers from its reviewed, trusted release set.
+resolver = MyApplicationBindingResolver(registered_handlers)  # Implements TrustedBindingResolver.
+loader = PreparedArtifactLoader(artifacts, catalog=prepared_catalog)
+loader.restore_catalog(resolver)
+
+engine = EvolutionaryEngine(
+    registry,
+    artifact_store=artifacts,
+    artifact_loader=loader,
+    approval_verifier=HmacEvolutionApprovalVerifier(
+        approval_secret,
+        nonce_store=SQLiteNonceStore("./var/approval-nonces.sqlite3"),
+    ),
+    proposal_store=proposal_store,
+    binding_resolver=resolver,
+    audit=SQLiteAuditLog("./var/evolution-audit.sqlite3"),
+)
+```
+
+On restart, proposals are hydrated only after both the candidate artifact and the previous/candidate handlers have been resolved. A `VALIDATING` proposal is marked `FAILED` because the in-flight validation result cannot be assumed. An interrupted `ACTIVATING` proposal is reconciled against the trusted registry: the candidate already active becomes `ACTIVE`; the previous handler still active returns the proposal to `APPROVED` for a safe retry; an unknown active handler fails closed. An interrupted rollback similarly resolves to `ROLLED_BACK`, `ACTIVE` or `FAILED` according to the trusted handler actually present. On bootstrap, generation values are rebased only when the expected previous or candidate handler identity is confirmed.
+
+For a proposal that is still awaiting activation, the engine rebases its expected registry generation only when the currently registered action is the exact trusted previous binding. This lets a trusted bootstrap reconstruct the registry with a different insertion count without accepting a change to the capability being evolved. The compare-and-swap remains active after that bootstrap snapshot.
+
+**Operational boundary:** `SQLiteEvolutionProposalStore` and `SQLitePreparedArtifactCatalog` support local durable filesystems, not multi-host consensus. The registry remains process-local. If the application wants an already-activated candidate to survive a restart, its trusted bootstrap/release layer must select that version and register the matching handler before constructing the engine. The proposal database records workflow state; it does not deploy or select binaries.
+
+The proposal store and audit sink are separate persistence boundaries. A crash can occur after proposal state is committed but before its audit event is written (or vice versa if an external audit adapter is used). Use startup reconciliation and externally anchored audit checkpoints; a single atomic transaction across these stores is not currently provided.

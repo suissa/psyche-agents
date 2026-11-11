@@ -25,7 +25,14 @@ from .health import (
     RecoveryResult,
     RuntimeHealthMonitor,
 )
-from .loader import ArtifactLoader, PreparedArtifactLoader
+from .loader import ArtifactLoader, PreparedArtifactLoader, TrustedBindingResolver
+from .persistence import (
+    EvolutionProposalStore,
+    PreparedArtifactCatalog,
+    ProposalConflict,
+    SQLiteEvolutionProposalStore,
+    SQLitePreparedArtifactCatalog,
+)
 from .models import (
     ApprovalToken,
     DecisionStatus,
@@ -73,6 +80,7 @@ __all__ = [
     "DispatchResult",
     "EvolutionApproval",
     "EvolutionProposal",
+    "EvolutionProposalStore",
     "EvolutionaryEngine",
     "FailureSignal",
     "HealthDecision",
@@ -90,7 +98,9 @@ __all__ = [
     "Intent",
     "JsonIntentExtractor",
     "NonceStore",
+    "PreparedArtifactCatalog",
     "PreparedArtifactLoader",
+    "ProposalConflict",
     "ProposalStatus",
     "PsycheRuntime",
     "RecoveryController",
@@ -100,6 +110,8 @@ __all__ = [
     "ReleaseSnapshot",
     "RuntimeHealthMonitor",
     "SQLiteArtifactStore",
+    "SQLiteEvolutionProposalStore",
+    "SQLitePreparedArtifactCatalog",
     "SQLiteAuditLog",
     "SQLiteReleaseCoordinator",
     "StaleGeneration",
@@ -114,6 +126,7 @@ __all__ = [
     "SideEffect",
     "ToolManifest",
     "ToolRegistry",
+    "TrustedBindingResolver",
     "ValidationOutcome",
     "ValidationReport",
     "sign_approval_token",
