@@ -624,15 +624,20 @@ class ArtifactAndEvolutionTests(unittest.TestCase):
 
     def test_artifact_tampering_before_validation_marks_proposal_failed(self) -> None:
         class TamperedStore(InMemoryArtifactStore):
+            corrupt = False
+
             def get(self, sha256: str) -> ArtifactRecord:
                 record = super().get(sha256)
-                return replace(record, content=b"tampered candidate")
+                if self.corrupt:
+                    return replace(record, content=b"tampered candidate")
+                return record
 
         registry = ToolRegistry()
         registry.register(ToolBinding(make_manifest(), EchoTool()))
+        store = TamperedStore()
         engine = EvolutionaryEngine(
             registry,
-            artifact_store=TamperedStore(),
+            artifact_store=store,
             approval_verifier=HmacEvolutionApprovalVerifier(EVOLUTION_SECRET),
         )
         proposal = engine.propose(
@@ -640,6 +645,7 @@ class ArtifactAndEvolutionTests(unittest.TestCase):
             registry.generation,
             artifact=b"original candidate",
         )
+        store.corrupt = True
         with self.assertRaisesRegex(RuntimeError, "candidate artifact changed"):
             engine.validate(proposal.proposal_id, AlwaysPassValidator())
         self.assertEqual(ProposalStatus.FAILED, engine.get(proposal.proposal_id).status)
