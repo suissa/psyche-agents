@@ -123,8 +123,8 @@ class SQLiteAuditLog:
         self.path = Path(path)
         if str(path) == ":memory:":
             raise ValueError("SQLiteAuditLog requires a durable filesystem path")
-        if timeout <= 0:
-            raise ValueError("SQLite timeout must be positive")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("SQLite timeout must be a finite positive number")
         self.timeout = timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection:
@@ -181,12 +181,40 @@ class SQLiteAuditLog:
                 connection.rollback()
                 raise
 
+    @staticmethod
+    def _rows_form_valid_chain(rows: list[tuple[object, ...]]) -> bool:
+        previous_hash = ZERO_HASH
+        expected_sequence = 1
+        for sequence, payload_json, stored_previous, stored_hash in rows:
+            if sequence != expected_sequence or stored_previous != previous_hash:
+                return False
+            try:
+                expected_hash = _chain_hash(previous_hash, payload_json)
+                if not isinstance(stored_hash, str):
+                    return False
+            except (UnicodeEncodeError, AttributeError, TypeError):
+                return False
+            if not hmac.compare_digest(expected_hash, stored_hash):
+                return False
+            previous_hash = stored_hash
+            expected_sequence += 1
+        return True
+
     def snapshot(self) -> tuple[AuditEvent, ...]:
+        # Verify the events in the same read snapshot used to deserialize them.
         with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
             rows = connection.execute(
-                "SELECT payload_json FROM audit_events ORDER BY sequence"
+                """
+                SELECT sequence, payload_json, previous_hash, event_hash
+                FROM audit_events ORDER BY sequence
+                """
             ).fetchall()
-        return tuple(_event_from_json(row[0]) for row in rows)
+            if not self._rows_form_valid_chain(rows):
+                raise AuditIntegrityError("audit hash chain verification failed")
+            events = tuple(_event_from_json(row[1]) for row in rows)
+            connection.commit()
+            return events
 
     def verify_chain(self) -> bool:
         with closing(self._connect()) as connection:
@@ -196,21 +224,7 @@ class SQLiteAuditLog:
                 FROM audit_events ORDER BY sequence
                 """
             ).fetchall()
-
-        previous_hash = ZERO_HASH
-        expected_sequence = 1
-        for sequence, payload_json, stored_previous, stored_hash in rows:
-            if sequence != expected_sequence or stored_previous != previous_hash:
-                return False
-            try:
-                expected_hash = _chain_hash(previous_hash, payload_json)
-            except (UnicodeEncodeError, AttributeError):
-                return False
-            if not hmac.compare_digest(expected_hash, stored_hash):
-                return False
-            previous_hash = stored_hash
-            expected_sequence += 1
-        return True
+        return self._rows_form_valid_chain(rows)
 
     def checkpoint(self) -> tuple[int, str]:
         """Return the current sequence and chain head for external anchoring."""

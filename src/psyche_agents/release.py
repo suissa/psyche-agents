@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
 import time
-import math
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,8 +97,8 @@ class SQLiteReleaseCoordinator:
         self.path = Path(path)
         if str(path) == ":memory:":
             raise ValueError("SQLiteReleaseCoordinator requires a durable filesystem path")
-        if timeout <= 0:
-            raise ValueError("SQLite timeout must be positive")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("SQLite timeout must be a finite positive number")
         self.clock = clock
         self.timeout = timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +224,8 @@ class SQLiteReleaseCoordinator:
         if not math.isfinite(now):
             raise ValueError("release coordinator clock must return a finite timestamp")
         expires_at = now + ttl_seconds
+        if not math.isfinite(expires_at):
+            raise ValueError("lease expiry must be a finite timestamp")
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -286,6 +288,8 @@ class SQLiteReleaseCoordinator:
         if not math.isfinite(now):
             raise ValueError("release coordinator clock must return a finite timestamp")
         expires_at = now + ttl_seconds
+        if not math.isfinite(expires_at):
+            raise ValueError("lease expiry must be a finite timestamp")
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
