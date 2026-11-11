@@ -141,6 +141,36 @@ class DeploymentAdapterContract:
         self.assertEqual(21, adopted_receipt.fencing_token)
         self.assertEqual(adopted_receipt, self.adapter.inspect(adopted_request.target_id))
 
+    def test_generation_cas_rejects_skipped_or_replayed_generation(self) -> None:
+        first_request = self.make_request(
+            fencing_token=30,
+            expected_generation=0,
+            idempotency_key="generation-1",
+        )
+        first = self.adapter.deploy(first_request)
+        second_request = self.make_request(
+            version="2.0.0",
+            content=b"contract-artifact-v2",
+            fencing_token=31,
+            expected_generation=1,
+            idempotency_key="generation-2",
+        )
+        second = self.adapter.deploy(second_request)
+        self.assertEqual(2, second.generation)
+        self.assertGreater(second.fencing_token, first.fencing_token)
+
+        stale_request = self.make_request(
+            version="3.0.0",
+            content=b"contract-artifact-v3",
+            fencing_token=32,
+            expected_generation=0,
+            idempotency_key="generation-replay",
+        )
+        with self.assertRaises(DeploymentDivergence):
+            self.adapter.deploy(stale_request)
+
+        self.assertEqual(second, self.adapter.inspect(second_request.target_id))
+
     def test_idempotency_keys_are_scoped_to_target(self) -> None:
         first_request = self.make_request(
             target_id="contract-service-a",
