@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import tempfile
 import unittest
+
+from deployment_adapter_contract import DeploymentAdapterContract
 from dataclasses import replace
 from pathlib import Path
 
@@ -71,6 +73,10 @@ class FakeDeploymentAdapter:
             current = self.current.get(request.target_id)
             if current is not None and current.fencing_token >= request.lease.fencing_token:
                 raise DeploymentDivergence("deployment fencing token did not advance")
+            if current is not None and request.generation != current.generation + 1:
+                raise DeploymentDivergence("deployment generation did not advance by exactly one")
+            if current is None and request.generation != 1:
+                raise DeploymentDivergence("initial deployment generation must be one")
             receipt = DeploymentReceipt(
                 target_id=request.target_id,
                 owner_id=request.owner_id,
@@ -333,6 +339,13 @@ class ReleaseExecutionTests(unittest.TestCase):
         with self.assertRaises(DeploymentDivergence):
             self.execute()
         self.assertEqual(0, self.coordinator.get("payments-api").generation)
+
+
+class FakeDeploymentAdapterContract(DeploymentAdapterContract, unittest.TestCase):
+    """Run the reusable provider contract against the reference fake adapter."""
+
+    def create_adapter(self) -> FakeDeploymentAdapter:
+        return FakeDeploymentAdapter()
 
 
 if __name__ == "__main__":
