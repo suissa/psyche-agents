@@ -334,9 +334,13 @@ class EvolutionaryEngine:
             created_by=creator_id,
         )
         with self._lock:
-            self._persist_proposal(proposal, creating=True)
+            self._persist_and_record(
+                proposal,
+                "proposal_created",
+                creating=True,
+                status=proposal.status.value,
+            )
             self._proposals[proposal.proposal_id] = proposal
-        self._record(proposal, "proposal_created", status=proposal.status.value)
         return proposal
 
     def propose_from_failure(
@@ -822,27 +826,25 @@ class EvolutionaryEngine:
         } and self._same_active_binding(proposal.previous_binding, current):
             if proposal.expected_generation != self.registry.generation:
                 recovered = replace(proposal, expected_generation=self.registry.generation)
-                self._persist_proposal(recovered)
-                self._proposals[proposal.proposal_id] = recovered
-                self._record(
+                self._persist_and_record(
                     recovered,
                     "proposal_rehydrated",
                     registry_generation=self.registry.generation,
                     rebased_expected_generation=True,
                 )
+                self._proposals[proposal.proposal_id] = recovered
             return
         if proposal.status is ProposalStatus.ACTIVE and self._same_active_binding(
             proposal.replacement, current
         ):
             if proposal.activation_generation != self.registry.generation:
                 recovered = replace(proposal, activation_generation=self.registry.generation)
-                self._persist_proposal(recovered)
-                self._proposals[proposal.proposal_id] = recovered
-                self._record(
+                self._persist_and_record(
                     recovered,
                     "proposal_rehydrated",
                     registry_generation=self.registry.generation,
                 )
+                self._proposals[proposal.proposal_id] = recovered
 
     def _require(
         self, proposal_id: str, expected_status: ProposalStatus
@@ -865,29 +867,72 @@ class EvolutionaryEngine:
                 f"invalid evolution transition: {proposal.status.value} -> {target.value}"
             )
         updated = replace(proposal, status=target)
-        self._persist_proposal(updated)
-        self._proposals[proposal.proposal_id] = updated
-        self._record(
+        self._persist_and_record(
             updated,
             "evolution_state_transition",
             previous_status=proposal.status.value,
             new_status=target.value,
             **details,
         )
+        self._proposals[proposal.proposal_id] = updated
         return updated
 
-    def _record(self, proposal: EvolutionProposal, event_type: str, **details: object) -> None:
-        self.audit.record(
-            AuditEvent(
-                event_type=event_type,
-                intent_id=proposal.proposal_id,
-                actor_id=proposal.approver_id or proposal.created_by,
-                timestamp=time.time(),
-                details={
-                    "artifact_sha256": proposal.artifact.sha256,
-                    "action": proposal.replacement.manifest.action,
-                    "candidate_version": proposal.replacement.manifest.version,
-                    **details,
-                },
+    def _persist_and_record(
+        self,
+        proposal: EvolutionProposal,
+        event_type: str,
+        *,
+        creating: bool = False,
+        **details: object,
+    ) -> None:
+        atomic_writer = getattr(self.proposal_store, "save_with_event", None)
+        if (
+            self.proposal_store is not None
+            and self.proposal_store is self.audit
+            and callable(atomic_writer)
+        ):
+            expected_revision = (
+                None if creating else self._revisions.get(proposal.proposal_id)
             )
+            if not creating and expected_revision is None:
+                raise RuntimeError("proposal revision is missing from durable state")
+            next_revision = 1 if expected_revision is None else expected_revision + 1
+            event = self._audit_event(
+                proposal,
+                event_type,
+                proposal_revision=next_revision,
+                **details,
+            )
+            revision = atomic_writer(
+                proposal.proposal_id,
+                self._proposal_payload(proposal),
+                expected_revision=expected_revision,
+                event=event,
+            )
+            self._revisions[proposal.proposal_id] = revision
+            return
+
+        self._persist_proposal(proposal, creating=creating)
+        self._record(proposal, event_type, **details)
+
+    def _audit_event(
+        self,
+        proposal: EvolutionProposal,
+        event_type: str,
+        **details: object,
+    ) -> AuditEvent:
+        return AuditEvent(
+            event_type=event_type,
+            intent_id=proposal.proposal_id,
+            actor_id=proposal.approver_id or proposal.created_by,
+            timestamp=time.time(),
+            details={
+                "artifact_sha256": proposal.artifact.sha256,
+                "action": proposal.replacement.manifest.action,
+                "candidate_version": proposal.replacement.manifest.version,
+                **details,
+            },
         )
+
+    def _record(self, proposal: EvolutionProposal, event_type: str, **details: object) -> None:
+        self.audit.record(self._audit_event(proposal, event_type, **details))

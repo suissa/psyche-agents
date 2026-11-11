@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -16,6 +17,7 @@ from psyche_agents.evolution import (
 from psyche_agents.loader import PreparedArtifactLoader
 from psyche_agents.models import SideEffect, ToolManifest, ValidationReport
 from psyche_agents.persistence import (
+    SQLiteEvolutionJournal,
     SQLiteEvolutionProposalStore,
     SQLitePreparedArtifactCatalog,
 )
@@ -296,6 +298,88 @@ class DurableEvolutionRecoveryTests(unittest.TestCase):
         recovered = restarted.get(proposal.proposal_id)
         self.assertEqual(ProposalStatus.ACTIVE, recovered.status)
         self.assertEqual(restarted_registry.generation, recovered.activation_generation)
+
+
+    def test_atomic_journal_commits_proposal_and_audit_events_together(self) -> None:
+        journal_path = self.root / "atomic-journal.sqlite3"
+        journal = SQLiteEvolutionJournal(journal_path)
+        registry = self.base_registry()
+        engine = EvolutionaryEngine(
+            registry,
+            artifact_store=self.artifacts,
+            artifact_loader=PreparedArtifactLoader(self.artifacts),
+            approval_verifier=HmacEvolutionApprovalVerifier(SECRET),
+            proposal_store=journal,
+            audit=journal,
+        )
+
+        proposal = engine.propose(
+            self.candidate,
+            registry.generation,
+            artifact=b"atomic-journal-candidate",
+        )
+        validated = engine.validate(proposal.proposal_id, PassingValidator())
+
+        self.assertEqual(ProposalStatus.VALIDATED, validated.status)
+        self.assertEqual(1, journal.count())
+        self.assertEqual(
+            [
+                "proposal_created",
+                "evolution_state_transition",
+                "evolution_state_transition",
+            ],
+            [event.event_type for event in journal.snapshot()],
+        )
+        self.assertTrue(journal.verify_chain())
+        persisted_id, payload, revision = journal.load_all()[0]
+        self.assertEqual(proposal.proposal_id, persisted_id)
+        self.assertEqual(ProposalStatus.VALIDATED.value, payload["status"])
+        self.assertEqual(3, revision)
+
+        reopened = SQLiteEvolutionJournal(journal_path)
+        self.assertEqual(ProposalStatus.VALIDATED.value, reopened.load_all()[0][1]["status"])
+        self.assertTrue(reopened.verify_chain())
+
+    def test_atomic_journal_rolls_back_proposal_revision_when_audit_insert_fails(self) -> None:
+        journal_path = self.root / "atomic-rollback.sqlite3"
+        journal = SQLiteEvolutionJournal(journal_path)
+        registry = self.base_registry()
+        engine = EvolutionaryEngine(
+            registry,
+            artifact_store=self.artifacts,
+            artifact_loader=PreparedArtifactLoader(self.artifacts),
+            proposal_store=journal,
+            audit=journal,
+        )
+        proposal = engine.propose(
+            self.candidate,
+            registry.generation,
+            artifact=b"atomic-journal-rollback-candidate",
+        )
+
+        with sqlite3.connect(journal_path) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_transition_audit
+                BEFORE INSERT ON audit_events
+                WHEN instr(NEW.payload_json, 'evolution_state_transition') > 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated audit sink failure');
+                END
+                """
+            )
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "simulated audit sink failure"):
+            engine.validate(proposal.proposal_id, PassingValidator())
+
+        current = engine.get(proposal.proposal_id)
+        self.assertEqual(ProposalStatus.PROPOSED, current.status)
+        persisted_id, payload, revision = journal.load_all()[0]
+        self.assertEqual(proposal.proposal_id, persisted_id)
+        self.assertEqual(ProposalStatus.PROPOSED.value, payload["status"])
+        self.assertEqual(1, revision)
+        self.assertEqual(["proposal_created"], [event.event_type for event in journal.snapshot()])
+        self.assertTrue(journal.verify_chain())
 
 
 if __name__ == "__main__":

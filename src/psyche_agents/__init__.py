@@ -30,6 +30,7 @@ from .persistence import (
     EvolutionProposalStore,
     PreparedArtifactCatalog,
     ProposalConflict,
+    SQLiteEvolutionJournal,
     SQLiteEvolutionProposalStore,
     SQLitePreparedArtifactCatalog,
 )
@@ -110,6 +111,7 @@ __all__ = [
     "ReleaseSnapshot",
     "RuntimeHealthMonitor",
     "SQLiteArtifactStore",
+    "SQLiteEvolutionJournal",
     "SQLiteEvolutionProposalStore",
     "SQLitePreparedArtifactCatalog",
     "SQLiteAuditLog",

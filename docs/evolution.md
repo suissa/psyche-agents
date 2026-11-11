@@ -164,4 +164,18 @@ For a proposal that is still awaiting activation, the engine rebases its expecte
 
 **Operational boundary:** `SQLiteEvolutionProposalStore` and `SQLitePreparedArtifactCatalog` support local durable filesystems, not multi-host consensus. The registry remains process-local. If the application wants an already-activated candidate to survive a restart, its trusted bootstrap/release layer must select that version and register the matching handler before constructing the engine. The proposal database records workflow state; it does not deploy or select binaries.
 
-The proposal store and audit sink are separate persistence boundaries. A crash can occur after proposal state is committed but before its audit event is written (or vice versa if an external audit adapter is used). Use startup reconciliation and externally anchored audit checkpoints; a single atomic transaction across these stores is not currently provided.
+When proposal metadata and audit events use separate adapters, they remain separate persistence boundaries. A crash can occur after the proposal revision is committed but before its audit event is written. For local SQLite deployments that require atomicity, configure one `SQLiteEvolutionJournal` instance as both `proposal_store` and `audit`:
+
+```python
+journal = SQLiteEvolutionJournal("./var/evolution-journal.sqlite3")
+engine = EvolutionaryEngine(
+    registry,
+    proposal_store=journal,
+    audit=journal,
+    # Configure the artifact store, trusted loader/resolver and approval verifier.
+)
+```
+
+The journal performs the proposal compare-and-swap and appends the SHA-256 chained audit event inside one `BEGIN IMMEDIATE` transaction. If either write fails, neither is committed. This applies to proposal creation, state transitions and restart-reconciliation updates. Passing different objects, even when they point to the same database file, does not activate the engine's atomic path.
+
+The transaction does not include artifact storage, nonce consumption, the process-local registry mutation or external deployment. The registry/release boundary still relies on the persisted ACTIVATING/ROLLING_BACK states and startup reconciliation. The journal is a local durable-filesystem adapter, not a multi-host consensus service. Continue exporting audit checkpoints to an independently controlled immutable system.

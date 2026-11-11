@@ -119,3 +119,22 @@ The release coordinator records deployment metadata only. It does not build, sig
 `SQLiteEvolutionProposalStore` saves proposal status, validation evidence, signed-approval metadata and activation generation with optimistic revision checks. `SQLitePreparedArtifactCatalog` stores only candidate digest-to-manifest metadata. At restart, the host supplies a `TrustedBindingResolver` that maps each persisted manifest to an already-prepared handler. Recovery rejects missing or mismatched handlers and reconciles interrupted lifecycle transitions against the current trusted registry.
 
 The database does not serialize executable handlers and does not decide which binary is deployed. The host bootstrap/release layer must register the active trusted version before constructing `EvolutionaryEngine`, provide a `TrustedBindingResolver`, and configure the same approval verifier so persisted approval signatures can be checked after restart. The SQLite stores are scoped to a durable local filesystem and multiple local processes; multi-host deployments need server-backed implementations.
+
+
+## Atomic proposal state and audit journal
+
+For a local deployment that requires proposal revisions and their audit evidence to commit together, use one `SQLiteEvolutionJournal` instance for both engine interfaces:
+
+```python
+journal = SQLiteEvolutionJournal("./var/evolution-journal.sqlite3")
+engine = EvolutionaryEngine(
+    registry,
+    proposal_store=journal,
+    audit=journal,
+    # Keep the trusted artifact store, loader, resolver and approval verifier configured.
+)
+```
+
+The journal writes the proposal revision with compare-and-swap and appends the corresponding SHA-256 chained audit event under one SQLite `BEGIN IMMEDIATE` transaction. If either write fails, both are rolled back. It also implements the ordinary proposal-store and audit-sink read APIs, so the existing recovery and checkpoint flows continue to work.
+
+This guarantee applies to proposal creation, lifecycle transitions and restart reconciliation only when the exact same journal instance is supplied for both interfaces. Separate adapters remain supported but are not atomic. Artifact bytes, prepared-handler metadata, approval nonce consumption, the process-local registry swap and external deployment remain separate boundaries. SQLite remains a single-host durable-filesystem adapter, not a multi-host consensus service.

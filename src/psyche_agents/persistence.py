@@ -9,7 +9,16 @@ from contextlib import closing
 from pathlib import Path
 from typing import Mapping, Protocol
 
-from .models import SideEffect, ToolManifest
+from .audit import (
+    AuditIntegrityError,
+    SQLiteAuditLog,
+    ZERO_HASH,
+    _canonical_json as _canonical_audit_json,
+    _chain_hash,
+    _event_from_json,
+    _event_payload,
+)
+from .models import AuditEvent, SideEffect, ToolManifest
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -213,6 +222,238 @@ class SQLiteEvolutionProposalStore:
             row = connection.execute("SELECT COUNT(*) FROM evolution_proposals").fetchone()
         return int(row[0])
 
+
+
+
+class SQLiteEvolutionJournal:
+    """One SQLite transaction boundary for proposal revisions and audit events.
+
+    Pass the same instance as both EvolutionaryEngine(proposal_store=..., audit=...).
+    A proposal CAS write and its hash-chained audit event then commit or roll back
+    together. Artifact storage and the process-local ToolRegistry remain separate.
+    """
+
+    def __init__(
+        self,
+        database_path: str | os.PathLike[str],
+        *,
+        timeout: float = 30.0,
+    ) -> None:
+        if str(database_path) == ":memory:":
+            raise ValueError("SQLiteEvolutionJournal requires a durable filesystem path")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("SQLite timeout must be a finite positive number")
+        self.database_path = Path(database_path)
+        self.timeout = timeout
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self._connect()) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS evolution_proposals (
+                    proposal_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload_json TEXT NOT NULL,
+                    previous_hash TEXT NOT NULL,
+                    event_hash TEXT NOT NULL UNIQUE
+                );
+                """
+            )
+        try:
+            os.chmod(self.database_path, 0o600)
+        except OSError:
+            pass
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.database_path,
+            timeout=self.timeout,
+            isolation_level=None,
+        )
+        connection.execute(f"PRAGMA busy_timeout={int(self.timeout * 1000)}")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    @staticmethod
+    def _save_on_connection(
+        connection: sqlite3.Connection,
+        proposal_id: str,
+        encoded: str,
+        expected_revision: int | None,
+    ) -> int:
+        current = connection.execute(
+            "SELECT revision FROM evolution_proposals WHERE proposal_id=?",
+            (proposal_id,),
+        ).fetchone()
+        if expected_revision is None:
+            if current is not None:
+                raise ProposalConflict("proposal already exists")
+            revision = 1
+            connection.execute(
+                """
+                INSERT INTO evolution_proposals (proposal_id, revision, payload_json)
+                VALUES (?, ?, ?)
+                """,
+                (proposal_id, revision, encoded),
+            )
+            return revision
+
+        if current is None or int(current[0]) != expected_revision:
+            raise ProposalConflict("proposal revision changed; refusing stale update")
+        revision = expected_revision + 1
+        cursor = connection.execute(
+            """
+            UPDATE evolution_proposals
+            SET revision=?, payload_json=?, updated_at=CURRENT_TIMESTAMP
+            WHERE proposal_id=? AND revision=?
+            """,
+            (revision, encoded, proposal_id, expected_revision),
+        )
+        if cursor.rowcount != 1:
+            raise ProposalConflict("proposal revision changed during update")
+        return revision
+
+    @staticmethod
+    def _append_audit_payload(
+        connection: sqlite3.Connection,
+        payload_json: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        previous_hash = str(row[0]) if row else ZERO_HASH
+        event_hash = _chain_hash(previous_hash, payload_json)
+        connection.execute(
+            """
+            INSERT INTO audit_events (payload_json, previous_hash, event_hash)
+            VALUES (?, ?, ?)
+            """,
+            (payload_json, previous_hash, event_hash),
+        )
+
+    def save(
+        self,
+        proposal_id: str,
+        payload: Mapping[str, object],
+        *,
+        expected_revision: int | None,
+    ) -> int:
+        encoded = SQLiteEvolutionProposalStore._encode(proposal_id, payload)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                revision = self._save_on_connection(
+                    connection, proposal_id, encoded, expected_revision
+                )
+                connection.commit()
+                return revision
+            except Exception:
+                connection.rollback()
+                raise
+
+    def save_with_event(
+        self,
+        proposal_id: str,
+        payload: Mapping[str, object],
+        *,
+        expected_revision: int | None,
+        event: AuditEvent,
+    ) -> int:
+        """CAS-save proposal metadata and append its audit event atomically."""
+        if not isinstance(event, AuditEvent):
+            raise TypeError("atomic journal events must be AuditEvent instances")
+        if event.intent_id != proposal_id:
+            raise ValueError("audit event subject must match the proposal ID")
+        encoded = SQLiteEvolutionProposalStore._encode(proposal_id, payload)
+        event_json = _canonical_audit_json(_event_payload(event))
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                revision = self._save_on_connection(
+                    connection, proposal_id, encoded, expected_revision
+                )
+                self._append_audit_payload(connection, event_json)
+                connection.commit()
+                return revision
+            except Exception:
+                connection.rollback()
+                raise
+
+    def load_all(self) -> tuple[tuple[str, dict[str, object], int], ...]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT proposal_id, payload_json, revision
+                FROM evolution_proposals ORDER BY proposal_id
+                """
+            ).fetchall()
+        return tuple(
+            (
+                str(row[0]),
+                SQLiteEvolutionProposalStore._decode(str(row[0]), str(row[1])),
+                int(row[2]),
+            )
+            for row in rows
+        )
+
+    def count(self) -> int:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM evolution_proposals"
+            ).fetchone()
+        return int(row[0])
+
+    def record(self, event: AuditEvent) -> None:
+        event_json = _canonical_audit_json(_event_payload(event))
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._append_audit_payload(connection, event_json)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    def snapshot(self) -> tuple[AuditEvent, ...]:
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                """
+                SELECT sequence, payload_json, previous_hash, event_hash
+                FROM audit_events ORDER BY sequence
+                """
+            ).fetchall()
+            if not SQLiteAuditLog._rows_form_valid_chain(rows):
+                connection.rollback()
+                raise AuditIntegrityError("audit hash chain verification failed")
+            events = tuple(_event_from_json(str(row[1])) for row in rows)
+            connection.commit()
+            return events
+
+    def verify_chain(self) -> bool:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT sequence, payload_json, previous_hash, event_hash
+                FROM audit_events ORDER BY sequence
+                """
+            ).fetchall()
+        return SQLiteAuditLog._rows_form_valid_chain(rows)
+
+    def checkpoint(self) -> tuple[int, str]:
+        """Return the current sequence and chain head for external anchoring."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT sequence, event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+        return (int(row[0]), str(row[1])) if row else (0, ZERO_HASH)
 
 class PreparedArtifactCatalog(Protocol):
     def put(self, artifact_sha256: str, manifest: ToolManifest) -> None: ...
