@@ -219,3 +219,14 @@ A retry cannot retarget the proposal, change its release owner, or generate a ne
 
 
 **Rollback boundary:** a release-aware proposal rejects the existing local-only `rollback()` method. Reverting only the in-process registry would leave the external provider on the candidate version. Provider-aware rollback is intentionally unavailable until the exact previous immutable deployment artifact and digest can be recovered from trusted storage and passed through the same fenced release protocol. A local registry swap is not proof of an external rollback.
+
+
+## Signed artifact provenance
+
+A release is not permitted to rely on a SHA-256 digest alone. `ReleaseExecutionService` requires an injected `ArtifactProvenanceVerifier` and an `ArtifactAttestation` that binds the artifact digest, byte length and media type, deployment target and immutable version, trusted builder identity, build ID, source revision, issue timestamp and signature.
+
+The service verifies this evidence before reading coordinator state, acquiring a lease or contacting the provider. A missing verifier, unknown builder, mismatched target/version/digest, altered signature or future-dated attestation fails closed. Attestations do not expire automatically because artifact provenance is immutable; builder revocation and key rotation are responsibilities of the verifier configuration.
+
+The reference `HmacArtifactProvenanceVerifier` uses an allowlist of builder IDs and a shared secret. A production build service should issue the attestation only after the artifact has been built from a reviewed source revision and passed the required validation pipeline. Production can replace the HMAC verifier with a registry-backed, keyless-signing or transparency-log verifier using the same protocol.
+
+Release-aware proposal activation stores the exact attestation before moving to `ACTIVATING`. The attestation is reloaded and compared on every retry, so a restart cannot substitute a different build identity or source revision for the previously approved artifact.

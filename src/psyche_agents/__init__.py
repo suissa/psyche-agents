@@ -7,6 +7,13 @@ from .artifacts import (
     SQLiteArtifactStore,
 )
 from .audit import AuditIntegrityError, InMemoryAuditLog, SQLiteAuditLog
+from .provenance import (
+    ArtifactAttestation,
+    ArtifactProvenanceError,
+    ArtifactProvenanceVerifier,
+    HmacArtifactProvenanceVerifier,
+    sign_artifact_attestation,
+)
 from .deployment import (
     DeploymentAdapter,
     DeploymentDivergence,
@@ -80,7 +87,10 @@ from .validation import (
 __all__ = [
     "ApprovalToken",
     "AuditIntegrityError",
+    "ArtifactAttestation",
     "ArtifactLoader",
+    "ArtifactProvenanceError",
+    "ArtifactProvenanceVerifier",
     "ArtifactRecord",
     "ArtifactStore",
     "ContainerSandboxRunner",
@@ -100,6 +110,7 @@ __all__ = [
     "HealthState",
     "HealthThresholds",
     "HmacApprovalVerifier",
+    "HmacArtifactProvenanceVerifier",
     "HmacEvolutionApprovalVerifier",
     "InMemoryArtifactStore",
     "InMemoryAuditLog",
@@ -144,5 +155,6 @@ __all__ = [
     "ValidationOutcome",
     "ValidationReport",
     "sign_approval_token",
+    "sign_artifact_attestation",
     "sign_evolution_approval",
 ]

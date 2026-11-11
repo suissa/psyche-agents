@@ -168,3 +168,12 @@ An interrupted release-aware proposal remains `ACTIVATING` during engine hydrati
 
 
 Release-aware proposals intentionally reject the existing local-only `rollback()` method. Reverting only the in-process registry would leave the external provider on the candidate version. Provider-aware rollback remains unavailable until the previous immutable deployment artifact and its verified digest are available to the release adapter; do not treat a local handler swap as an external rollback.
+
+
+## Artifact provenance attestations
+
+Provider-backed release execution fails closed unless `ReleaseExecutionService` is configured with an `ArtifactProvenanceVerifier` and each release includes a signed `ArtifactAttestation`. The attestation binds the immutable artifact digest, byte size, media type, release target and version to an allowlisted builder identity, build ID and source revision.
+
+The trusted build service creates the attestation after building and reviewing the artifact. The release application verifies it before reading coordinator state, acquiring a lease or calling the provider. Release-aware proposals persist the exact attestation alongside the target, generation and idempotency key, and retries must present that same attestation after restart.
+
+HMAC signing is provided as a dependency-free reference implementation. Store and rotate the signing key in trusted build infrastructure; do not put it in candidate artifacts or repository source. Production environments may inject a verifier backed by their artifact registry, keyless signing or transparency system. The HMAC implementation is a reference trust mechanism, not a substitute for a hardened build identity system.

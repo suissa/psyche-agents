@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .artifacts import ArtifactRecord
+from .provenance import ArtifactAttestation, ArtifactProvenanceError, ArtifactProvenanceVerifier
 from .release import (
     IdempotencyConflict,
     LeaseLost,
@@ -43,6 +44,7 @@ class DeploymentRequest:
     expected_generation: int
     version: str
     artifact: ArtifactRecord
+    attestation: ArtifactAttestation
     idempotency_key: str
 
     @property
@@ -82,9 +84,31 @@ class ReleaseExecutionService:
         self,
         coordinator: ReleaseCoordinator,
         adapter: DeploymentAdapter,
+        *,
+        provenance_verifier: ArtifactProvenanceVerifier | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.adapter = adapter
+        self.provenance_verifier = provenance_verifier
+
+    def verify_provenance(
+        self,
+        artifact: ArtifactRecord,
+        *,
+        target_id: str,
+        version: str,
+        attestation: ArtifactAttestation,
+    ) -> None:
+        verifier = self.provenance_verifier
+        if verifier is None or not verifier.verify(
+            artifact,
+            target_id=target_id,
+            version=version,
+            attestation=attestation,
+        ):
+            raise ArtifactProvenanceError(
+                "artifact provenance is missing, untrusted or does not match this release"
+            )
 
     def execute(
         self,
@@ -94,6 +118,7 @@ class ReleaseExecutionService:
         expected_generation: int,
         version: str,
         artifact: ArtifactRecord,
+        attestation: ArtifactAttestation,
         idempotency_key: str,
         ttl_seconds: float = 60.0,
     ) -> ReleaseSnapshot:
@@ -105,6 +130,12 @@ class ReleaseExecutionService:
             artifact,
             idempotency_key,
             ttl_seconds,
+        )
+        self.verify_provenance(
+            artifact,
+            target_id=target_id,
+            version=version,
+            attestation=attestation,
         )
         current = self.coordinator.get(target_id)
         observed = self._inspect(target_id)
@@ -170,6 +201,7 @@ class ReleaseExecutionService:
                 expected_generation=expected_generation,
                 version=version,
                 artifact=artifact,
+                attestation=attestation,
                 idempotency_key=idempotency_key,
             )
             receipt = self.adapter.deploy(request)
