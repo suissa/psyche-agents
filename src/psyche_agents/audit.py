@@ -81,12 +81,30 @@ def _chain_hash(previous_hash: str, payload_json: str) -> str:
 def _event_from_json(payload_json: str) -> AuditEvent:
     try:
         payload = json.loads(payload_json)
+        if not isinstance(payload, dict):
+            raise TypeError("event payload must be an object")
+        event_type = payload["event_type"]
+        intent_id = payload["intent_id"]
+        actor_id = payload["actor_id"]
+        timestamp = float(payload["timestamp"])
+        details = payload["details"]
+        if (
+            not isinstance(event_type, str)
+            or not event_type.strip()
+            or not isinstance(intent_id, str)
+            or not intent_id.strip()
+            or not isinstance(actor_id, str)
+            or not actor_id.strip()
+            or not math.isfinite(timestamp)
+            or not isinstance(details, dict)
+        ):
+            raise ValueError("event fields have invalid types or values")
         return AuditEvent(
-            event_type=payload["event_type"],
-            intent_id=payload["intent_id"],
-            actor_id=payload["actor_id"],
-            timestamp=float(payload["timestamp"]),
-            details=payload["details"],
+            event_type=event_type,
+            intent_id=intent_id,
+            actor_id=actor_id,
+            timestamp=timestamp,
+            details=details,
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise AuditIntegrityError("stored audit event is malformed") from error

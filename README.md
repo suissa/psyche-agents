@@ -68,7 +68,7 @@ SandboxCandidateValidator connects EvolutionaryEngine.validate() to SandboxOrche
 
 PreparedArtifactLoader resolves the approved digest to an already-prepared ToolBinding without importing or executing artifact bytes. The trusted builder must prove that the prepared handler corresponds to the candidate digest. RuntimeHealthMonitor evaluates supplied error-rate, p95-latency and contract-failure samples; RecoveryController can roll back the active binding through CAS.
 
-The container engine, validation image, candidate builder, approver identity service and application telemetry adapter remain trusted integration boundaries. Proposal state, prepared-handler catalog and the default audit sink are still in memory. The current rollback updates the in-process registry and is not a distributed release rollback.
+The container engine, validation image, candidate builder, approver identity service and application telemetry adapter remain trusted integration boundaries. Proposal state and the prepared-handler catalog are still in memory. The default audit sink remains `InMemoryAuditLog`, while `SQLiteAuditLog` is available as an opt-in durable sink. The current rollback updates the in-process registry and is not a distributed release rollback.
 
 
 ## Sandboxed validation, persistent artifacts and recovery
@@ -102,7 +102,7 @@ Example configuration:
 
 The GitHub Actions workflow builds a small local validator fixture and runs an actual container integration test that verifies candidate readability, read-only root filesystem, zero Linux capabilities, no-new-privileges and disabled networking.
 
-SQLite stores are intended for a local durable filesystem. Multi-host production should inject object storage and a shared transactional nonce store. Evolution proposal state, the prepared-handler catalog and the default audit sink remain in memory; distributed activation and durable audit are not implemented yet.
+SQLite stores are intended for a local durable filesystem. Multi-host production should inject object storage, a shared transactional nonce store and a server-backed release coordinator. Evolution proposal state and the prepared-handler catalog remain in memory; the default audit sink remains in-memory unless `SQLiteAuditLog` is supplied. Multi-host distributed activation is not implemented yet.
 
 
 ## Durable evolution history and release coordination
