@@ -165,3 +165,6 @@ active = engine.activate_with_release(
 Before the provider side effect, the engine persists the target, owner, coordinator generation and deterministic idempotency key on the proposal and moves it to `ACTIVATING`. It marks the proposal `ACTIVE` only after the provider receipt is verified, the release coordinator confirms the expected generation, and the local registry has been reconciled to the trusted candidate binding.
 
 An interrupted release-aware proposal remains `ACTIVATING` during engine hydration. The host must resume it through `activate_with_release()` with the same target and owner. This recovers both the provider-success/coordinator-failure window and the coordinator-success/local-registry-failure window without deploying twice. The engine never silently changes the persisted release target, owner, generation or idempotency key.
+
+
+Release-aware proposals intentionally reject the existing local-only `rollback()` method. Reverting only the in-process registry would leave the external provider on the candidate version. Provider-aware rollback remains unavailable until the previous immutable deployment artifact and its verified digest are available to the release adapter; do not treat a local handler swap as an external rollback.

@@ -661,6 +661,11 @@ class EvolutionaryEngine:
         """Restore the previously active binding using CAS; never overwrite a newer change."""
         with self._lock:
             proposal = self._require(proposal_id, ProposalStatus.ACTIVE)
+            if proposal.release_target_id is not None:
+                raise RuntimeError(
+                    "release-aware proposals cannot use local-only rollback; "
+                    "provider-aware rollback requires a separately verified previous artifact"
+                )
             if proposal.activation_generation is None:
                 raise RuntimeError("active proposal is missing its activation generation")
             proposal = self._transition(proposal, ProposalStatus.ROLLING_BACK)

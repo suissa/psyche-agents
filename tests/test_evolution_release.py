@@ -302,6 +302,26 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
         self.assertEqual(1, self.adapter.calls)
         self.assertEqual(self.candidate.handler, restarted_registry.resolve("catalog_lookup").handler)
 
+    def test_release_aware_proposal_rejects_local_only_rollback(self) -> None:
+        registry = self.registry()
+        engine = self.new_engine(registry)
+        proposal_id = self.approved_proposal(engine)
+        active = engine.activate_with_release(
+            proposal_id,
+            self.service(),
+            target_id="catalog-service",
+            owner_id="release-controller",
+            ttl_seconds=30,
+        )
+        self.assertEqual(ProposalStatus.ACTIVE, active.status)
+
+        with self.assertRaisesRegex(RuntimeError, "provider-aware rollback"):
+            engine.rollback(proposal_id)
+
+        self.assertEqual(ProposalStatus.ACTIVE, engine.get(proposal_id).status)
+        self.assertEqual(1, self.coordinator.get("catalog-service").generation)
+        self.assertEqual(self.candidate.handler, registry.resolve("catalog_lookup").handler)
+
     def test_release_retry_cannot_change_persisted_target_or_owner(self) -> None:
         registry = self.registry()
         engine = self.new_engine(registry)
