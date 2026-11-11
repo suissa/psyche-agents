@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import tempfile
 import unittest
+
+from deployment_adapter_contract import DeploymentAdapterContract
 from dataclasses import replace
 from pathlib import Path
 
@@ -333,6 +335,13 @@ class ReleaseExecutionTests(unittest.TestCase):
         with self.assertRaises(DeploymentDivergence):
             self.execute()
         self.assertEqual(0, self.coordinator.get("payments-api").generation)
+
+
+class FakeDeploymentAdapterContract(DeploymentAdapterContract, unittest.TestCase):
+    """Run the reusable provider contract against the reference fake adapter."""
+
+    def create_adapter(self) -> FakeDeploymentAdapter:
+        return FakeDeploymentAdapter()
 
 
 if __name__ == "__main__":
