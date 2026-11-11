@@ -196,3 +196,23 @@ If the provider operation succeeds but coordinator persistence fails, the next e
 The repository includes the provider-neutral protocol and integration tests with a fake adapter. It does not include a production cloud/Kubernetes/VM adapter. A real adapter must be implemented against the deployment platform's own transactional and fencing primitives; the SQLite coordinator alone is not a distributed lock or deployment system.
 
 This protocol does not execute candidate Python, JavaScript or LLM-generated source. The adapter must operate on reviewed, built and prepared artifacts. The coordinator and external provider do not share a distributed transaction; correctness across that boundary depends on idempotency, fencing, inspection and reconciliation.
+
+
+## Release-aware proposal activation
+
+Use `EvolutionaryEngine.activate_with_release()` to connect the approved proposal lifecycle to `ReleaseExecutionService`:
+
+```python
+active = engine.activate_with_release(
+    proposal_id,
+    release_execution_service,
+    target_id="catalog-service",
+    owner_id="release-controller",
+)
+```
+
+Before any external deployment side effect, the engine durably stores the release target, owner, expected coordinator generation and deterministic idempotency key on the proposal, then transitions it to `ACTIVATING`. The external artifact is the same content-addressed and validated `ArtifactRecord` bound to the human approval. The proposal reaches `ACTIVE` only after provider inspection matches the returned receipt, coordinator generation matches the expected release, and the local registry is switched to the trusted prepared candidate handler.
+
+On restart, a release-aware `ACTIVATING` proposal is deliberately not auto-classified from the local registry alone. Resume it with `activate_with_release()` using the same target and owner. The method reuses the persisted generation/key, verifies the exact immutable artifact again, and lets `ReleaseExecutionService` reconcile a provider-ahead receipt or return a read-only confirmation for an already committed release. It then reconciles the local registry: the exact trusted previous handler may be replaced; the exact trusted candidate handler is accepted; any unknown handler fails closed.
+
+A retry cannot retarget the proposal, change its release owner, or generate a new idempotency key. A coordinator conflict or provider error leaves the proposal in `ACTIVATING` because the external side effect may have completed; it must be reconciled explicitly rather than marked failed. The release receipt generation and fencing token are persisted with the final `ACTIVE` transition. This does not create a distributed transaction between provider, coordinator and process-local registry, but it makes the recovery protocol durable and testable.

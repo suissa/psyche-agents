@@ -147,3 +147,21 @@ This guarantee applies to proposal creation, lifecycle transitions and restart r
 The service verifies the immutable artifact digest, compares provider state with the coordinator before and after acquiring a lease, deploys through the adapter, verifies the returned receipt against an independent inspection, and only then commits release metadata. A retry can reconcile a provider deployment that succeeded before the coordinator commit failed: the exact pending receipt is adopted idempotently with a newer fencing token before the coordinator is advanced.
 
 No cloud, Kubernetes or VM provider is bundled. The repository supplies the contract and orchestration boundary, not a claim that a specific production environment has been deployed. Provider adapters must not execute arbitrary LLM-generated source; they should accept only reviewed, built and prepared artifacts. The coordinator and provider do not share a distributed transaction, so recovery depends on adapter-enforced idempotency, fencing and accurate inspection.
+
+
+## Release-aware evolution activation
+
+An approved proposal can now be activated through the external release path instead of only replacing the local registry:
+
+```python
+active = engine.activate_with_release(
+    proposal_id,
+    release_execution_service,
+    target_id="catalog-service",
+    owner_id="release-controller",
+)
+```
+
+Before the provider side effect, the engine persists the target, owner, coordinator generation and deterministic idempotency key on the proposal and moves it to `ACTIVATING`. It marks the proposal `ACTIVE` only after the provider receipt is verified, the release coordinator confirms the expected generation, and the local registry has been reconciled to the trusted candidate binding.
+
+An interrupted release-aware proposal remains `ACTIVATING` during engine hydration. The host must resume it through `activate_with_release()` with the same target and owner. This recovers both the provider-success/coordinator-failure window and the coordinator-success/local-registry-failure window without deploying twice. The engine never silently changes the persisted release target, owner, generation or idempotency key.

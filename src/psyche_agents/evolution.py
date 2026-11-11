@@ -12,6 +12,7 @@ from typing import Callable, Protocol
 
 from .artifacts import ArtifactRecord, ArtifactStore, InMemoryArtifactStore
 from .audit import AuditSink, InMemoryAuditLog
+from .deployment import ReleaseExecutionService
 from .models import AuditEvent, ValidationReport
 from .registry import ToolBinding, ToolRegistry
 from .loader import ArtifactLoader, PreparedArtifactLoader, TrustedBindingResolver
@@ -73,6 +74,12 @@ class EvolutionProposal:
     approval_expires_at: int | None = None
     approval_signature: str | None = None
     activation_generation: int | None = None
+    release_target_id: str | None = None
+    release_owner_id: str | None = None
+    release_expected_generation: int | None = None
+    release_idempotency_key: str | None = None
+    release_generation: int | None = None
+    release_fencing_token: int | None = None
 
 
 class CandidateValidator(Protocol):
@@ -507,6 +514,149 @@ class EvolutionaryEngine:
             updated = replace(current, activation_generation=new_generation)
             return self._transition(updated, ProposalStatus.ACTIVE)
 
+    def activate_with_release(
+        self,
+        proposal_id: str,
+        release_service: ReleaseExecutionService,
+        *,
+        target_id: str,
+        owner_id: str,
+        ttl_seconds: float = 60.0,
+    ) -> EvolutionProposal:
+        """Deploy an approved proposal and activate its trusted local binding.
+
+        The release intent is persisted before the external side effect. If the
+        provider succeeds but the coordinator or local registry step fails, the
+        proposal remains ACTIVATING and can be resumed with the same target/owner.
+        The persisted generation and idempotency key are never silently rebased.
+        """
+        if not isinstance(target_id, str) or not target_id.strip():
+            raise ValueError("release target ID is required")
+        if not isinstance(owner_id, str) or not owner_id.strip():
+            raise ValueError("release owner ID is required")
+
+        with self._lock:
+            proposal = self._proposals[proposal_id]
+            if proposal.status is ProposalStatus.APPROVED:
+                if any(
+                    value is not None
+                    for value in (
+                        proposal.release_target_id,
+                        proposal.release_owner_id,
+                        proposal.release_expected_generation,
+                        proposal.release_idempotency_key,
+                        proposal.release_generation,
+                        proposal.release_fencing_token,
+                    )
+                ):
+                    raise RuntimeError("approved proposal already contains release metadata")
+                baseline = release_service.coordinator.get(target_id)
+                release_key = f"psyche-evolution:{proposal.proposal_id}"
+                proposal = replace(
+                    proposal,
+                    release_target_id=target_id,
+                    release_owner_id=owner_id,
+                    release_expected_generation=baseline.generation,
+                    release_idempotency_key=release_key,
+                )
+                proposal = self._transition(
+                    proposal,
+                    ProposalStatus.ACTIVATING,
+                    release_target_id=target_id,
+                    release_expected_generation=baseline.generation,
+                    release_idempotency_key=release_key,
+                )
+            elif proposal.status in (ProposalStatus.ACTIVATING, ProposalStatus.ACTIVE):
+                if (
+                    proposal.release_target_id != target_id
+                    or proposal.release_owner_id != owner_id
+                    or proposal.release_expected_generation is None
+                    or proposal.release_idempotency_key
+                    != f"psyche-evolution:{proposal.proposal_id}"
+                ):
+                    raise RuntimeError(
+                        "release activation can only resume with its persisted target, owner and idempotency key"
+                    )
+            else:
+                raise RuntimeError(
+                    f"proposal must be approved or awaiting release recovery, got {proposal.status.value}"
+                )
+
+        # Re-validate immutable candidate bytes and the trusted prepared binding on
+        # every attempt, including retries after a process restart.
+        stored = self.artifact_store.get(proposal.artifact.sha256)
+        if not stored.verify() or stored.content != proposal.artifact.content:
+            raise RuntimeError("candidate artifact failed integrity verification")
+        prepared_binding = self.artifact_loader.load(proposal.artifact.sha256)
+        if prepared_binding.manifest != proposal.replacement.manifest:
+            raise RuntimeError("prepared handler manifest does not match the approved candidate")
+
+        assert proposal.release_expected_generation is not None
+        assert proposal.release_target_id is not None
+        assert proposal.release_owner_id is not None
+        assert proposal.release_idempotency_key is not None
+        snapshot = release_service.execute(
+            proposal.release_target_id,
+            proposal.release_owner_id,
+            expected_generation=proposal.release_expected_generation,
+            version=proposal.replacement.manifest.version,
+            artifact=stored,
+            idempotency_key=proposal.release_idempotency_key,
+            ttl_seconds=ttl_seconds,
+        )
+        if (
+            snapshot.target_id != proposal.release_target_id
+            or snapshot.generation != proposal.release_expected_generation + 1
+            or snapshot.version != proposal.replacement.manifest.version
+            or snapshot.artifact_sha256 != proposal.artifact.sha256
+            or snapshot.fencing_token < 1
+        ):
+            raise RuntimeError("release coordinator returned a snapshot that does not match the proposal")
+
+        # Provider deployment is confirmed. Now reconcile this process's local
+        # runtime registry. A different active binding is never overwritten.
+        current_binding = self.registry.resolve(proposal.replacement.manifest.action)
+        if self._same_active_binding(prepared_binding, current_binding):
+            local_generation = self.registry.generation
+        elif self._same_active_binding(proposal.previous_binding, current_binding):
+            local_generation_before_swap = self.registry.generation
+            local_generation = self.registry.replace(
+                prepared_binding,
+                expected_generation=local_generation_before_swap,
+            )
+        else:
+            raise RuntimeError(
+                "external release succeeded but local registry contains an unknown binding; "
+                "restore the trusted previous or candidate handler before retrying"
+            )
+
+        with self._lock:
+            latest = self._proposals[proposal_id]
+            if latest.status is ProposalStatus.ACTIVE:
+                if (
+                    latest.release_generation != snapshot.generation
+                    or latest.release_fencing_token != snapshot.fencing_token
+                    or latest.activation_generation != local_generation
+                ):
+                    raise RuntimeError("active proposal release evidence does not match the coordinator")
+                return latest
+            if latest.status is not ProposalStatus.ACTIVATING:
+                raise RuntimeError("proposal state changed during external release execution")
+            updated = replace(
+                latest,
+                activation_generation=local_generation,
+                release_generation=snapshot.generation,
+                release_fencing_token=snapshot.fencing_token,
+            )
+            return self._transition(
+                updated,
+                ProposalStatus.ACTIVE,
+                release_target_id=target_id,
+                release_generation=snapshot.generation,
+                release_fencing_token=snapshot.fencing_token,
+                local_registry_generation=local_generation,
+            )
+
     def rollback(self, proposal_id: str) -> EvolutionProposal:
         """Restore the previously active binding using CAS; never overwrite a newer change."""
         with self._lock:
@@ -567,6 +717,12 @@ class EvolutionaryEngine:
             "approval_expires_at": proposal.approval_expires_at,
             "approval_signature": proposal.approval_signature,
             "activation_generation": proposal.activation_generation,
+            "release_target_id": proposal.release_target_id,
+            "release_owner_id": proposal.release_owner_id,
+            "release_expected_generation": proposal.release_expected_generation,
+            "release_idempotency_key": proposal.release_idempotency_key,
+            "release_generation": proposal.release_generation,
+            "release_fencing_token": proposal.release_fencing_token,
         }
 
     def _persist_proposal(
@@ -637,6 +793,12 @@ class EvolutionaryEngine:
             approval_expires_at = payload.get("approval_expires_at")
             approval_signature = payload.get("approval_signature")
             activation_generation = payload["activation_generation"]
+            release_target_id = payload.get("release_target_id")
+            release_owner_id = payload.get("release_owner_id")
+            release_expected_generation = payload.get("release_expected_generation")
+            release_idempotency_key = payload.get("release_idempotency_key")
+            release_generation = payload.get("release_generation")
+            release_fencing_token = payload.get("release_fencing_token")
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(f"persisted proposal metadata is invalid: {proposal_id}") from error
         if (
@@ -653,9 +815,53 @@ class EvolutionaryEngine:
             or (approval_issued_at is not None and not isinstance(approval_issued_at, int))
             or (approval_expires_at is not None and not isinstance(approval_expires_at, int))
             or (approval_signature is not None and not isinstance(approval_signature, str))
-            or (activation_generation is not None and not isinstance(activation_generation, int))
+            or (activation_generation is not None and (
+                not isinstance(activation_generation, int) or isinstance(activation_generation, bool)
+            ))
+            or (release_target_id is not None and (
+                not isinstance(release_target_id, str) or not release_target_id.strip()
+            ))
+            or (release_owner_id is not None and (
+                not isinstance(release_owner_id, str) or not release_owner_id.strip()
+            ))
+            or (release_expected_generation is not None and (
+                not isinstance(release_expected_generation, int)
+                or isinstance(release_expected_generation, bool)
+                or release_expected_generation < 0
+            ))
+            or (release_idempotency_key is not None and (
+                not isinstance(release_idempotency_key, str) or not release_idempotency_key.strip()
+            ))
+            or (release_generation is not None and (
+                not isinstance(release_generation, int)
+                or isinstance(release_generation, bool)
+                or release_generation < 1
+            ))
+            or (release_fencing_token is not None and (
+                not isinstance(release_fencing_token, int)
+                or isinstance(release_fencing_token, bool)
+                or release_fencing_token < 1
+            ))
         ):
             raise RuntimeError(f"persisted proposal fields are invalid: {proposal_id}")
+        release_intent_fields = (
+            release_target_id,
+            release_owner_id,
+            release_expected_generation,
+            release_idempotency_key,
+        )
+        if any(value is not None for value in release_intent_fields) and not all(
+            value is not None for value in release_intent_fields
+        ):
+            raise RuntimeError("persisted release intent is incomplete")
+        if (release_generation is None) != (release_fencing_token is None):
+            raise RuntimeError("persisted release receipt metadata is incomplete")
+        if release_generation is not None and (
+            release_target_id is None or status is not ProposalStatus.ACTIVE
+        ):
+            raise RuntimeError("persisted release receipt is not attached to an active release proposal")
+        if status is ProposalStatus.ACTIVE and release_target_id is not None and release_generation is None:
+            raise RuntimeError("active release proposal is missing its provider receipt")
         artifact = self.artifact_store.get(artifact_sha256)
         if (
             not artifact.verify()
@@ -739,6 +945,12 @@ class EvolutionaryEngine:
             approval_expires_at=approval_expires_at,
             approval_signature=approval_signature,
             activation_generation=activation_generation,
+            release_target_id=release_target_id,
+            release_owner_id=release_owner_id,
+            release_expected_generation=release_expected_generation,
+            release_idempotency_key=release_idempotency_key,
+            release_generation=release_generation,
+            release_fencing_token=release_fencing_token,
         )
         if status in approval_required_statuses:
             verifier = self.approval_verifier
@@ -775,6 +987,10 @@ class EvolutionaryEngine:
             )
             return
         if proposal.status is ProposalStatus.ACTIVATING:
+            if proposal.release_target_id is not None:
+                # Provider state can only be reconciled with its release coordinator.
+                # The caller must explicitly resume through activate_with_release().
+                return
             if self._same_active_binding(proposal.replacement, current):
                 recovered = replace(proposal, activation_generation=self.registry.generation)
                 self._transition(
