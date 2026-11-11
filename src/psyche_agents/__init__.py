@@ -7,6 +7,13 @@ from .artifacts import (
     SQLiteArtifactStore,
 )
 from .audit import AuditIntegrityError, InMemoryAuditLog, SQLiteAuditLog
+from .deployment import (
+    DeploymentAdapter,
+    DeploymentDivergence,
+    DeploymentReceipt,
+    DeploymentRequest,
+    ReleaseExecutionService,
+)
 from .evolution import (
     EvolutionApproval,
     EvolutionProposal,
@@ -78,6 +85,10 @@ __all__ = [
     "ArtifactStore",
     "ContainerSandboxRunner",
     "DecisionStatus",
+    "DeploymentAdapter",
+    "DeploymentDivergence",
+    "DeploymentReceipt",
+    "DeploymentRequest",
     "DispatchResult",
     "EvolutionApproval",
     "EvolutionProposal",
@@ -107,6 +118,7 @@ __all__ = [
     "RecoveryController",
     "RecoveryResult",
     "ReleaseCoordinator",
+    "ReleaseExecutionService",
     "ReleaseLease",
     "ReleaseSnapshot",
     "RuntimeHealthMonitor",

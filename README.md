@@ -138,3 +138,12 @@ engine = EvolutionaryEngine(
 The journal writes the proposal revision with compare-and-swap and appends the corresponding SHA-256 chained audit event under one SQLite `BEGIN IMMEDIATE` transaction. If either write fails, both are rolled back. It also implements the ordinary proposal-store and audit-sink read APIs, so the existing recovery and checkpoint flows continue to work.
 
 This guarantee applies to proposal creation, lifecycle transitions and restart reconciliation only when the exact same journal instance is supplied for both interfaces. Separate adapters remain supported but are not atomic. Artifact bytes, prepared-handler metadata, approval nonce consumption, the process-local registry swap and external deployment remain separate boundaries. SQLite remains a single-host durable-filesystem adapter, not a multi-host consensus service.
+
+
+## Provider-backed release execution
+
+`ReleaseExecutionService` composes the fenced `ReleaseCoordinator` with a trusted `DeploymentAdapter`. The adapter is responsible for the actual provider operation and must enforce fencing tokens at the deployment target, idempotency by target/key, payload binding and safe inspection of the effective deployment pointer.
+
+The service verifies the immutable artifact digest, compares provider state with the coordinator before and after acquiring a lease, deploys through the adapter, verifies the returned receipt against an independent inspection, and only then commits release metadata. A retry can reconcile a provider deployment that succeeded before the coordinator commit failed: the exact pending receipt is adopted idempotently with a newer fencing token before the coordinator is advanced.
+
+No cloud, Kubernetes or VM provider is bundled. The repository supplies the contract and orchestration boundary, not a claim that a specific production environment has been deployed. Provider adapters must not execute arbitrary LLM-generated source; they should accept only reviewed, built and prepared artifacts. The coordinator and provider do not share a distributed transaction, so recovery depends on adapter-enforced idempotency, fencing and accurate inspection.

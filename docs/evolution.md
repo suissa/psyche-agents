@@ -179,3 +179,20 @@ engine = EvolutionaryEngine(
 The journal performs the proposal compare-and-swap and appends the SHA-256 chained audit event inside one `BEGIN IMMEDIATE` transaction. If either write fails, neither is committed. This applies to proposal creation, state transitions and restart-reconciliation updates. Passing different objects, even when they point to the same database file, does not activate the engine's atomic path.
 
 The transaction does not include artifact storage, nonce consumption, the process-local registry mutation or external deployment. The registry/release boundary still relies on the persisted ACTIVATING/ROLLING_BACK states and startup reconciliation. The journal is a local durable-filesystem adapter, not a multi-host consensus service. Continue exporting audit checkpoints to an independently controlled immutable system.
+
+
+## Provider-backed release execution
+
+`ReleaseExecutionService` separates the durable release coordinator from the provider-specific deployment mechanism. It accepts a verified `ArtifactRecord`, acquires a fenced lease, checks that the provider's effective pointer agrees with the coordinator, asks a trusted `DeploymentAdapter` to deploy, verifies the returned receipt against a subsequent provider inspection, and commits the new generation only after those checks succeed.
+
+The adapter contract must implement:
+- idempotent deployment for `(target_id, idempotency_key)`, rejecting key reuse for a different owner or artifact/version payload;
+- monotonic fencing enforcement at the actual deployment target, not only in the SQLite coordinator;
+- authoritative inspection of the currently effective deployment pointer;
+- adoption of an exact pending deployment with a newer fencing token after a coordinator-commit failure.
+
+If the provider operation succeeds but coordinator persistence fails, the next execution recognizes only a receipt matching the exact target, owner, generation, version, digest and idempotency key. It then asks the adapter to adopt that deployment with a newer fence and completes the coordinator commit. Unknown provider drift fails closed. An immediate retry after a fully committed release is read-only and does not acquire another lease.
+
+The repository includes the provider-neutral protocol and integration tests with a fake adapter. It does not include a production cloud/Kubernetes/VM adapter. A real adapter must be implemented against the deployment platform's own transactional and fencing primitives; the SQLite coordinator alone is not a distributed lock or deployment system.
+
+This protocol does not execute candidate Python, JavaScript or LLM-generated source. The adapter must operate on reviewed, built and prepared artifacts. The coordinator and external provider do not share a distributed transaction; correctness across that boundary depends on idempotency, fencing, inspection and reconciliation.
