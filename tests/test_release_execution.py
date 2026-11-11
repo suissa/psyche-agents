@@ -73,6 +73,10 @@ class FakeDeploymentAdapter:
             current = self.current.get(request.target_id)
             if current is not None and current.fencing_token >= request.lease.fencing_token:
                 raise DeploymentDivergence("deployment fencing token did not advance")
+            if current is not None and request.generation != current.generation + 1:
+                raise DeploymentDivergence("deployment generation did not advance by exactly one")
+            if current is None and request.generation != 1:
+                raise DeploymentDivergence("initial deployment generation must be one")
             receipt = DeploymentReceipt(
                 target_id=request.target_id,
                 owner_id=request.owner_id,
