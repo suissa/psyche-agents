@@ -44,7 +44,7 @@ The container runner's image and commands are trusted deployment configuration. 
 
 PreparedArtifactLoader maps a verified artifact digest to a ToolBinding that has already been prepared by trusted application/build code. On activation, the engine resolves the exact approved digest and checks that the loaded manifest equals the candidate manifest before replacing the active registry binding.
 
-The loader never imports, evaluates or executes artifact bytes. A production build pipeline must verify provenance and prepare the handler in a trusted process before staging it. The current loader catalog is in-memory; a process restart requires the release/bootstrap layer to re-register its trusted prepared handlers.
+The loader never imports, evaluates or executes artifact bytes. A production build pipeline must verify provenance and prepare the handler in a trusted process before staging it. The runtime handler map is in-memory; an optional SQLitePreparedArtifactCatalog persists only digest-to-manifest metadata. A process restart still requires the release/bootstrap layer to supply the already-prepared handler through TrustedBindingResolver.
 
 ## Human approval and replay protection
 
@@ -70,7 +70,7 @@ The monitor does not collect telemetry itself. Production must connect an observ
 
 ## Audit and persistence boundaries
 
-The ArtifactStore and optional nonce store have SQLite implementations. Evolution proposal state, prepared handler catalog and default audit sink are still in memory. Production must add durable proposal state, tamper-evident audit storage and transactional coordination between registry changes and audit persistence.
+Artifact bytes, approval nonces, proposal metadata, prepared-artifact metadata and audit events now have opt-in SQLite implementations. The default adapters remain in-memory. The SQLite adapters coordinate multiple processes on one host and a durable local filesystem; multi-host production needs server-backed stores. The proposal store uses optimistic revisions to reject stale writes. Audit and proposal state currently live in separate stores, so deployment must monitor and reconcile a failure between those writes.
 
 ## Deliberate boundaries
 
@@ -79,3 +79,154 @@ The ArtifactStore and optional nonce store have SQLite implementations. Evolutio
 - The trusted build/loader pipeline must prepare the handler for the exact candidate artifact.
 - The container daemon and pinned validation image are trusted computing-base components.
 - The engine swaps an already-prepared ToolBinding; a complete source-to-binary build and release pipeline is not supplied.
+
+
+## Durable audit and release coordination
+
+Pass `SQLiteAuditLog` as the engine's `audit` sink to preserve proposal creation and lifecycle transitions across process restarts:
+
+```python
+audit = SQLiteAuditLog("./var/psyche-audit.sqlite3")
+engine = EvolutionaryEngine(registry, audit=audit)
+
+# Periodically export this tuple to a separately controlled system.
+sequence, chain_head = audit.checkpoint()
+if not audit.verify_chain():
+    raise RuntimeError("evolution audit integrity check failed")
+```
+
+The audit sink stores canonical JSON records in an append-only table. Each entry hashes the preceding entry and its own payload. Concurrent writers serialize through SQLite's `BEGIN IMMEDIATE` transaction. The checkpoint (sequence and chain head) should be exported to a separately controlled immutable store; without an external anchor, an administrator able to rewrite the entire database can recompute the chain. SQLite WAL and FULL synchronous mode are enabled, and the database file is restricted to owner access where the filesystem supports POSIX permissions.
+
+The release boundary is represented by the `ReleaseCoordinator` protocol. `SQLiteReleaseCoordinator` provides a durable implementation with:
+
+- per-target exclusive leases and monotonic fencing tokens;
+- lease renewal and explicit release;
+- generation-based compare-and-swap before publishing a new release record;
+- idempotency keys that return the original result for an identical retry and reject key reuse with a different payload;
+- a hash-chained release event log written in the same transaction as lease and release state.
+
+Example:
+
+```python
+coordinator = SQLiteReleaseCoordinator("./var/releases.sqlite3")
+lease = coordinator.acquire("payments-api", "release-controller-1", ttl_seconds=30)
+snapshot = coordinator.commit(
+    lease,
+    expected_generation=0,
+    version="1.1.0",
+    artifact_sha256="<sha256-of-trusted-prepared-artifact>",
+    idempotency_key="payments-api-1.1.0",
+)
+```
+
+A fencing token prevents a worker whose lease expired or was superseded from committing after a newer worker has acquired the target. Generation CAS prevents publishing against a state that changed after it was read. The idempotency key handles retries after an uncertain response; reusing it for a different owner or release payload fails.
+
+**Deployment boundary:** this SQLite coordinator supports multiple processes sharing one durable local database and filesystem. It is not a multi-host consensus system, and SQLite over NFS or an unreliable network filesystem is not supported. Multi-host deployment must provide a server-backed implementation of `ReleaseCoordinator` with transactional lease/fencing and generation-CAS semantics. The `EvolutionaryEngine` still performs an in-process `ToolRegistry` swap; an application release adapter must connect the coordinator to its actual deployment/routing system. It must not treat a coordinator record as proof that code was built, signed or deployed.
+
+Proposal history can be made durable immediately by injecting `SQLiteAuditLog`; prepared handlers and active in-process bindings still need a trusted bootstrap/catalog on restart. The audit log is a durable event history, not a serializer for Python handler objects.
+
+
+## Durable proposal recovery and trusted handler rehydration
+
+`SQLiteEvolutionProposalStore` persists proposal metadata, validation results, approval evidence, lifecycle status and activation generation. Every update increments a revision and uses compare-and-swap; a process with stale proposal state cannot silently overwrite a newer transition. Candidate bytes remain in `ArtifactStore` and are referenced by SHA-256. Handler objects, Python modules and executable code are never serialized.
+
+`SQLitePreparedArtifactCatalog` persists only the association between an artifact digest and its expected `ToolManifest`. At process startup, `PreparedArtifactLoader.restore_catalog(resolver)` asks a host-supplied `TrustedBindingResolver` for an already-prepared handler. The loader verifies that the returned manifest is an exact match and that the referenced artifact still exists and passes its digest check. A resolver mismatch, missing artifact or missing trusted handler prevents recovery.
+
+Example bootstrap:
+
+```python
+artifacts = SQLiteArtifactStore("./var/artifacts.sqlite3")
+proposal_store = SQLiteEvolutionProposalStore("./var/proposals.sqlite3")
+prepared_catalog = SQLitePreparedArtifactCatalog("./var/prepared.sqlite3")
+
+# The application constructs these handlers from its reviewed, trusted release set.
+resolver = MyApplicationBindingResolver(registered_handlers)  # Implements TrustedBindingResolver.
+loader = PreparedArtifactLoader(artifacts, catalog=prepared_catalog)
+loader.restore_catalog(resolver)
+
+engine = EvolutionaryEngine(
+    registry,
+    artifact_store=artifacts,
+    artifact_loader=loader,
+    approval_verifier=HmacEvolutionApprovalVerifier(
+        approval_secret,
+        nonce_store=SQLiteNonceStore("./var/approval-nonces.sqlite3"),
+    ),
+    proposal_store=proposal_store,
+    binding_resolver=resolver,
+    audit=SQLiteAuditLog("./var/evolution-audit.sqlite3"),
+)
+```
+
+On restart, proposals are hydrated only after both the candidate artifact and the previous/candidate handlers have been resolved. A `VALIDATING` proposal is marked `FAILED` because the in-flight validation result cannot be assumed. An interrupted `ACTIVATING` proposal is reconciled against the trusted registry: the candidate already active becomes `ACTIVE`; the previous handler still active returns the proposal to `APPROVED` for a safe retry; an unknown active handler fails closed. An interrupted rollback similarly resolves to `ROLLED_BACK`, `ACTIVE` or `FAILED` according to the trusted handler actually present. On bootstrap, generation values are rebased only when the expected previous or candidate handler identity is confirmed.
+
+For a proposal that is still awaiting activation, the engine rebases its expected registry generation only when the currently registered action is the exact trusted previous binding. This lets a trusted bootstrap reconstruct the registry with a different insertion count without accepting a change to the capability being evolved. The compare-and-swap remains active after that bootstrap snapshot.
+
+**Operational boundary:** `SQLiteEvolutionProposalStore` and `SQLitePreparedArtifactCatalog` support local durable filesystems, not multi-host consensus. The registry remains process-local. If the application wants an already-activated candidate to survive a restart, its trusted bootstrap/release layer must select that version and register the matching handler before constructing the engine. The proposal database records workflow state; it does not deploy or select binaries.
+
+When proposal metadata and audit events use separate adapters, they remain separate persistence boundaries. A crash can occur after the proposal revision is committed but before its audit event is written. For local SQLite deployments that require atomicity, configure one `SQLiteEvolutionJournal` instance as both `proposal_store` and `audit`:
+
+```python
+journal = SQLiteEvolutionJournal("./var/evolution-journal.sqlite3")
+engine = EvolutionaryEngine(
+    registry,
+    proposal_store=journal,
+    audit=journal,
+    # Configure the artifact store, trusted loader/resolver and approval verifier.
+)
+```
+
+The journal performs the proposal compare-and-swap and appends the SHA-256 chained audit event inside one `BEGIN IMMEDIATE` transaction. If either write fails, neither is committed. This applies to proposal creation, state transitions and restart-reconciliation updates. Passing different objects, even when they point to the same database file, does not activate the engine's atomic path.
+
+The transaction does not include artifact storage, nonce consumption, the process-local registry mutation or external deployment. The registry/release boundary still relies on the persisted ACTIVATING/ROLLING_BACK states and startup reconciliation. The journal is a local durable-filesystem adapter, not a multi-host consensus service. Continue exporting audit checkpoints to an independently controlled immutable system.
+
+
+## Provider-backed release execution
+
+`ReleaseExecutionService` separates the durable release coordinator from the provider-specific deployment mechanism. It accepts a verified `ArtifactRecord`, acquires a fenced lease, checks that the provider's effective pointer agrees with the coordinator, asks a trusted `DeploymentAdapter` to deploy, verifies the returned receipt against a subsequent provider inspection, and commits the new generation only after those checks succeed.
+
+The adapter contract must implement:
+- idempotent deployment for `(target_id, idempotency_key)`, rejecting key reuse for a different owner or artifact/version payload;
+- monotonic fencing enforcement at the actual deployment target, not only in the SQLite coordinator;
+- authoritative inspection of the currently effective deployment pointer;
+- adoption of an exact pending deployment with a newer fencing token after a coordinator-commit failure.
+
+If the provider operation succeeds but coordinator persistence fails, the next execution recognizes only a receipt matching the exact target, owner, generation, version, digest and idempotency key. It then asks the adapter to adopt that deployment with a newer fence and completes the coordinator commit. Unknown provider drift fails closed. An immediate retry after a fully committed release is read-only and does not acquire another lease.
+
+The repository includes the provider-neutral protocol and integration tests with a fake adapter. It does not include a production cloud/Kubernetes/VM adapter. A real adapter must be implemented against the deployment platform's own transactional and fencing primitives; the SQLite coordinator alone is not a distributed lock or deployment system.
+
+This protocol does not execute candidate Python, JavaScript or LLM-generated source. The adapter must operate on reviewed, built and prepared artifacts. The coordinator and external provider do not share a distributed transaction; correctness across that boundary depends on idempotency, fencing, inspection and reconciliation.
+
+
+## Release-aware proposal activation
+
+Use `EvolutionaryEngine.activate_with_release()` to connect the approved proposal lifecycle to `ReleaseExecutionService`:
+
+```python
+active = engine.activate_with_release(
+    proposal_id,
+    release_execution_service,
+    target_id="catalog-service",
+    owner_id="release-controller",
+)
+```
+
+Before any external deployment side effect, the engine durably stores the release target, owner, expected coordinator generation and deterministic idempotency key on the proposal, then transitions it to `ACTIVATING`. The external artifact is the same content-addressed and validated `ArtifactRecord` bound to the human approval. The proposal reaches `ACTIVE` only after provider inspection matches the returned receipt, coordinator generation matches the expected release, and the local registry is switched to the trusted prepared candidate handler.
+
+On restart, a release-aware `ACTIVATING` proposal is deliberately not auto-classified from the local registry alone. Resume it with `activate_with_release()` using the same target and owner. The method reuses the persisted generation/key, verifies the exact immutable artifact again, and lets `ReleaseExecutionService` reconcile a provider-ahead receipt or return a read-only confirmation for an already committed release. It then reconciles the local registry: the exact trusted previous handler may be replaced; the exact trusted candidate handler is accepted; any unknown handler fails closed.
+
+A retry cannot retarget the proposal, change its release owner, or generate a new idempotency key. A coordinator conflict or provider error leaves the proposal in `ACTIVATING` because the external side effect may have completed; it must be reconciled explicitly rather than marked failed. The release receipt generation and fencing token are persisted with the final `ACTIVE` transition. This does not create a distributed transaction between provider, coordinator and process-local registry, but it makes the recovery protocol durable and testable.
+
+
+**Rollback boundary:** a release-aware proposal rejects the existing local-only `rollback()` method. Reverting only the in-process registry would leave the external provider on the candidate version. Provider-aware rollback is intentionally unavailable until the exact previous immutable deployment artifact and digest can be recovered from trusted storage and passed through the same fenced release protocol. A local registry swap is not proof of an external rollback.
+
+
+## Signed artifact provenance
+
+A release is not permitted to rely on a SHA-256 digest alone. `ReleaseExecutionService` requires an injected `ArtifactProvenanceVerifier` and an `ArtifactAttestation` that binds the artifact digest, byte length and media type, deployment target and immutable version, trusted builder identity, build ID, source revision, issue timestamp and signature.
+
+The service verifies this evidence before reading coordinator state, acquiring a lease or contacting the provider. A missing verifier, unknown builder, mismatched target/version/digest, altered signature or future-dated attestation fails closed. Attestations do not expire automatically because artifact provenance is immutable; builder revocation and key rotation are responsibilities of the verifier configuration.
+
+The reference `HmacArtifactProvenanceVerifier` uses an allowlist of builder IDs and a shared secret. A production build service should issue the attestation only after the artifact has been built from a reviewed source revision and passed the required validation pipeline. Production can replace the HMAC verifier with a registry-backed, keyless-signing or transparency-log verifier using the same protocol.
+
+Release-aware proposal activation stores the exact attestation before moving to `ACTIVATING`. The attestation is reloaded and compared on every retry, so a restart cannot substitute a different build identity or source revision for the previously approved artifact.

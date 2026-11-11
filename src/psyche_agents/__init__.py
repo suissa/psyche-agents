@@ -6,7 +6,21 @@ from .artifacts import (
     InMemoryArtifactStore,
     SQLiteArtifactStore,
 )
-from .audit import InMemoryAuditLog
+from .audit import AuditIntegrityError, InMemoryAuditLog, SQLiteAuditLog
+from .provenance import (
+    ArtifactAttestation,
+    ArtifactProvenanceError,
+    ArtifactProvenanceVerifier,
+    HmacArtifactProvenanceVerifier,
+    sign_artifact_attestation,
+)
+from .deployment import (
+    DeploymentAdapter,
+    DeploymentDivergence,
+    DeploymentReceipt,
+    DeploymentRequest,
+    ReleaseExecutionService,
+)
 from .evolution import (
     EvolutionApproval,
     EvolutionProposal,
@@ -25,7 +39,15 @@ from .health import (
     RecoveryResult,
     RuntimeHealthMonitor,
 )
-from .loader import ArtifactLoader, PreparedArtifactLoader
+from .loader import ArtifactLoader, PreparedArtifactLoader, TrustedBindingResolver
+from .persistence import (
+    EvolutionProposalStore,
+    PreparedArtifactCatalog,
+    ProposalConflict,
+    SQLiteEvolutionJournal,
+    SQLiteEvolutionProposalStore,
+    SQLitePreparedArtifactCatalog,
+)
 from .models import (
     ApprovalToken,
     DecisionStatus,
@@ -38,6 +60,16 @@ from .models import (
 from .policy import HmacApprovalVerifier, SecurityPolicy, sign_approval_token
 from .registry import ToolRegistry
 from .replay import InMemoryNonceStore, NonceStore, SQLiteNonceStore
+from .release import (
+    IdempotencyConflict,
+    LeaseBusy,
+    LeaseLost,
+    ReleaseCoordinator,
+    ReleaseLease,
+    ReleaseSnapshot,
+    SQLiteReleaseCoordinator,
+    StaleGeneration,
+)
 from .runtime import JsonIntentExtractor, PsycheRuntime
 from .sandbox import (
     ContainerSandboxRunner,
@@ -54,14 +86,23 @@ from .validation import (
 
 __all__ = [
     "ApprovalToken",
+    "AuditIntegrityError",
+    "ArtifactAttestation",
     "ArtifactLoader",
+    "ArtifactProvenanceError",
+    "ArtifactProvenanceVerifier",
     "ArtifactRecord",
     "ArtifactStore",
     "ContainerSandboxRunner",
     "DecisionStatus",
+    "DeploymentAdapter",
+    "DeploymentDivergence",
+    "DeploymentReceipt",
+    "DeploymentRequest",
     "DispatchResult",
     "EvolutionApproval",
     "EvolutionProposal",
+    "EvolutionProposalStore",
     "EvolutionaryEngine",
     "FailureSignal",
     "HealthDecision",
@@ -69,20 +110,36 @@ __all__ = [
     "HealthState",
     "HealthThresholds",
     "HmacApprovalVerifier",
+    "HmacArtifactProvenanceVerifier",
     "HmacEvolutionApprovalVerifier",
     "InMemoryArtifactStore",
     "InMemoryAuditLog",
+    "IdempotencyConflict",
+    "LeaseBusy",
+    "LeaseLost",
     "InMemoryNonceStore",
     "Intent",
     "JsonIntentExtractor",
     "NonceStore",
+    "PreparedArtifactCatalog",
     "PreparedArtifactLoader",
+    "ProposalConflict",
     "ProposalStatus",
     "PsycheRuntime",
     "RecoveryController",
     "RecoveryResult",
+    "ReleaseCoordinator",
+    "ReleaseExecutionService",
+    "ReleaseLease",
+    "ReleaseSnapshot",
     "RuntimeHealthMonitor",
     "SQLiteArtifactStore",
+    "SQLiteEvolutionJournal",
+    "SQLiteEvolutionProposalStore",
+    "SQLitePreparedArtifactCatalog",
+    "SQLiteAuditLog",
+    "SQLiteReleaseCoordinator",
+    "StaleGeneration",
     "SQLiteNonceStore",
     "SandboxCandidateValidator",
     "SandboxCheck",
@@ -94,8 +151,10 @@ __all__ = [
     "SideEffect",
     "ToolManifest",
     "ToolRegistry",
+    "TrustedBindingResolver",
     "ValidationOutcome",
     "ValidationReport",
     "sign_approval_token",
+    "sign_artifact_attestation",
     "sign_evolution_approval",
 ]
