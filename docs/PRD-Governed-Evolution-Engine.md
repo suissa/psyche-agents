@@ -328,3 +328,12 @@ O Evolutionary Engine segue o princípio de **Governed Self-Evolution**.
 **Resultado esperado:** um substrate multiagente capaz de evoluir suas capacidades sem execução irrestrita de código, preservando segurança, disponibilidade e integridade operacional.
 
 **Definição de sucesso:** o sistema aprende com suas falhas, transforma evidências em melhorias verificáveis e incorpora evoluções aprovadas sem comprometer a estabilidade das capacidades existentes.
+
+
+## Implementation addendum — sandbox and recovery boundaries
+
+The reference implementation uses a digest-pinned container image and a static command matrix. The runner disables networking, uses a read-only root filesystem and artifact mount, drops Linux capabilities, enforces no-new-privileges and numeric non-root execution, and applies CPU, memory, PID, time, output and artifact-size bounds. The validation image and container engine remain trusted components.
+
+Local durability is provided by SQLiteArtifactStore and SQLiteNonceStore. Both are intended for a local durable filesystem; multi-host deployments require object storage and a shared transactional nonce service.
+
+The prepared artifact loader maps a verified digest to a handler that has already been prepared by trusted build code. It does not import or execute LLM-generated source. The runtime health monitor consumes metrics supplied by the host application and can trigger CAS rollback according to configured thresholds; it does not collect telemetry or distribute a rollback across hosts.

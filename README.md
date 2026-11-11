@@ -62,6 +62,44 @@ The implementation now binds each proposal to immutable candidate bytes stored b
 
 Activation uses the registry generation captured when the proposal was created. A stale generation fails closed. The previous ToolBinding is retained and can be restored through a second compare-and-swap operation.
 
-The reference artifact store and approval nonce cache are in-memory implementations. Production deployments must replace them with durable immutable object storage and a shared, atomic replay-prevention store. The trusted approval gateway must authenticate the human before issuing an HMAC token.
+The project now includes SQLiteArtifactStore for durable, content-addressed artifacts and SQLiteNonceStore for atomic one-time approval nonces across processes sharing a local database. The in-memory adapters remain useful for tests. Multi-host deployments should inject object storage and a shared transactional nonce store.
 
-CandidateValidator is a trusted boundary: it must validate that the executable handler it has prepared corresponds to the exact candidate artifact supplied to it. The current engine swaps an already-loaded handler; it does not compile or execute generated source.
+SandboxCandidateValidator connects EvolutionaryEngine.validate() to SandboxOrchestrator. ContainerSandboxRunner supports digest-pinned Docker/Podman images, no network, read-only filesystem and candidate mount, dropped capabilities, no-new-privileges, non-root execution, bounded CPU/memory/PIDs/time/output and a noexec temporary filesystem. Rootless Podman is recommended.
+
+PreparedArtifactLoader resolves the approved digest to an already-prepared ToolBinding without importing or executing artifact bytes. The trusted builder must prove that the prepared handler corresponds to the candidate digest. RuntimeHealthMonitor evaluates supplied error-rate, p95-latency and contract-failure samples; RecoveryController can roll back the active binding through CAS.
+
+The container engine, validation image, candidate builder, approver identity service and application telemetry adapter remain trusted integration boundaries. Proposal state, prepared-handler catalog and the default audit sink are still in memory. The current rollback updates the in-process registry and is not a distributed release rollback.
+
+
+## Sandboxed validation, persistent artifacts and recovery
+
+The next evolution layer is implemented in these modules:
+
+- `sandbox.py`: digest-pinned Docker/Podman runner with no network, read-only root filesystem and candidate mount, dropped capabilities, no-new-privileges, non-root UID/GID, CPU/memory/PID/time/output/artifact limits and a noexec temporary filesystem.
+- `validation.py`: `SandboxOrchestrator` and `SandboxCandidateValidator` connect a named validation matrix to `EvolutionaryEngine.validate()`.
+- `artifacts.py`: `SQLiteArtifactStore` provides durable content-addressed artifacts with SHA-256 verification and WAL/FULL durability.
+- `replay.py`: `SQLiteNonceStore` atomically consumes one-time approval nonces across processes sharing a local database.
+- `loader.py`: `PreparedArtifactLoader` resolves an approved digest to an already-prepared trusted handler; it never evaluates artifact bytes.
+- `health.py`: `RuntimeHealthMonitor` evaluates supplied error-rate, p95-latency and contract-failure samples and can call `RecoveryController` for CAS rollback.
+
+A production runner needs a locally available, reviewed validation image pinned by digest. `SandboxCheck` commands are trusted deployment configuration and are passed as an argument vector, never through a shell. The container engine and its daemon remain part of the trusted computing base; rootless Podman is recommended.
+
+Example configuration:
+
+    runner = ContainerSandboxRunner(
+        image="registry.example/psyche-validator@sha256:<64-hex-digest>",
+        engine="podman",
+    )
+    checks = (
+        SandboxCheck("unit", ("/opt/validator/unit-check",)),
+        SandboxCheck("contract", ("/opt/validator/contract-check",)),
+        SandboxCheck("security", ("/opt/validator/security-check",)),
+    )
+    validator = SandboxCandidateValidator(
+        SandboxOrchestrator(runner),
+        checks,
+    )
+
+The GitHub Actions workflow builds a small local validator fixture and runs an actual container integration test that verifies candidate readability, read-only root filesystem, zero Linux capabilities, no-new-privileges and disabled networking.
+
+SQLite stores are intended for a local durable filesystem. Multi-host production should inject object storage and a shared transactional nonce store. Evolution proposal state, the prepared-handler catalog and the default audit sink remain in memory; distributed activation and durable audit are not implemented yet.

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 import time
+import tempfile
 import unittest
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 
 from psyche_agents import (
     DecisionStatus,
@@ -12,6 +15,8 @@ from psyche_agents import (
     HmacEvolutionApprovalVerifier,
     InMemoryArtifactStore,
     InMemoryAuditLog,
+    SQLiteArtifactStore,
+    SQLiteNonceStore,
     Intent,
     ProposalStatus,
     PsycheRuntime,
@@ -24,6 +29,18 @@ from psyche_agents import (
     sign_evolution_approval,
 )
 from psyche_agents.artifacts import ArtifactRecord
+from psyche_agents.health import (
+    HealthSample,
+    HealthState,
+    HealthThresholds,
+    RuntimeHealthMonitor,
+)
+from psyche_agents.sandbox import (
+    ContainerSandboxRunner,
+    SandboxCheck,
+    SandboxExecution,
+)
+from psyche_agents.validation import SandboxCandidateValidator, SandboxOrchestrator
 from psyche_agents.archetypes import Evidence, HeroAgent, RetryableOperationError, SageAgent
 from psyche_agents.evolution import FailureSignal
 from psyche_agents.policy import SuperegoAgent
@@ -84,12 +101,14 @@ def new_evolution_engine(
     *,
     clock=time.time,
     audit: InMemoryAuditLog | None = None,
+    nonce_store=None,
 ) -> EvolutionaryEngine:
     return EvolutionaryEngine(
         registry,
         approval_verifier=HmacEvolutionApprovalVerifier(
             EVOLUTION_SECRET,
             clock=clock,
+            nonce_store=nonce_store,
         ),
         audit=audit,
     )
@@ -120,6 +139,30 @@ def approve_proposal(engine: EvolutionaryEngine, proposal):
         expires_at=int(time.time()) + 120,
     )
     return engine.approve(proposal.proposal_id, approval)
+
+
+class FakeSandboxRunner:
+    def __init__(
+        self,
+        exit_codes: dict[str, int] | None = None,
+        timeouts: frozenset[str] = frozenset(),
+    ) -> None:
+        self.exit_codes = exit_codes or {}
+        self.timeouts = timeouts
+        self.calls: list[tuple[str, str]] = []
+
+    def run(self, artifact: ArtifactRecord, check: SandboxCheck) -> SandboxExecution:
+        self.calls.append((artifact.sha256, check.name))
+        timed_out = check.name in self.timeouts
+        exit_code = None if timed_out else self.exit_codes.get(check.name, 0)
+        return SandboxExecution(
+            check_name=check.name,
+            exit_code=exit_code,
+            stdout="",
+            stderr="synthetic failure" if exit_code else "",
+            timed_out=timed_out,
+            duration_seconds=0.01,
+        )
 
 
 class PsycheRuntimeTests(unittest.TestCase):
@@ -643,6 +686,272 @@ class ArtifactAndEvolutionTests(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             engine.activate(proposal.proposal_id)
+
+
+class PersistenceSandboxAndRecoveryTests(unittest.TestCase):
+    def test_sqlite_artifact_store_persists_content_addressed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "artifacts.sqlite3"
+            first_store = SQLiteArtifactStore(path)
+            original = first_store.put(b"candidate source bundle", "application/zip")
+            reopened_store = SQLiteArtifactStore(path)
+            restored = reopened_store.get(original.sha256)
+
+            self.assertEqual(original, restored)
+            self.assertTrue(restored.verify())
+            self.assertEqual(1, reopened_store.count())
+            self.assertTrue(reopened_store.contains(original.sha256))
+
+    def test_sqlite_nonce_store_blocks_replay_across_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approval-nonces.sqlite3"
+            first = SQLiteNonceStore(path)
+            second = SQLiteNonceStore(path)
+
+            self.assertTrue(first.consume("approval-nonce-1", 2_000, 1_000))
+            self.assertFalse(second.consume("approval-nonce-1", 2_000, 1_000))
+            self.assertFalse(second.consume("expired-nonce", 900, 1_000))
+            self.assertEqual(1, second.count())
+
+    def test_evolution_approval_nonce_is_durable_across_verifier_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "evolution-nonces.sqlite3"
+            store = SQLiteNonceStore(path)
+            registry = ToolRegistry()
+            registry.register(ToolBinding(make_manifest(), EchoTool()))
+            engine = new_evolution_engine(registry, nonce_store=store)
+            validated = create_validated_proposal(engine, registry)
+            approval = sign_evolution_approval(
+                EVOLUTION_SECRET,
+                validated,
+                "release-approver",
+                int(time.time()) + 120,
+                nonce="durable-evolution-approval-nonce",
+            )
+
+            approved = engine.approve(validated.proposal_id, approval)
+            restarted_verifier = HmacEvolutionApprovalVerifier(
+                EVOLUTION_SECRET,
+                nonce_store=SQLiteNonceStore(path),
+            )
+
+            self.assertEqual(ProposalStatus.APPROVED, approved.status)
+            self.assertFalse(restarted_verifier.verify(approved, approval))
+
+    def test_container_runner_enforces_isolation_and_resource_arguments(self) -> None:
+        image = "registry.example/psyche-validator@sha256:" + "a" * 64
+        runner = ContainerSandboxRunner(
+            image=image,
+            engine="podman",
+            executable_path="/usr/bin/podman",
+        )
+        check = SandboxCheck(
+            "unit",
+            ("/opt/validator/run-check", "--strict"),
+            {"LANG": "C"},
+        )
+        command = runner.build_command(Path("/tmp/candidate-artifact"), check)
+
+        for required in (
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--pids-limit",
+            "--memory",
+            "--cpus",
+            "--user",
+            "--tmpfs",
+            "--mount",
+            image,
+            "/opt/validator/run-check",
+            "/candidate/artifact.bin",
+        ):
+            self.assertIn(required, command)
+        self.assertIn("readonly", command[command.index("--mount") + 1])
+        self.assertIn("LANG=C", command)
+        self.assertNotIn("sh", command)
+
+
+    def test_sandbox_limits_reject_non_finite_values(self) -> None:
+        from psyche_agents.sandbox import SandboxLimits
+
+        with self.assertRaisesRegex(ValueError, "timeout"):
+            SandboxLimits(timeout_seconds=float("nan"))
+        with self.assertRaisesRegex(ValueError, "cpu_limit"):
+            SandboxLimits(cpu_limit=float("nan"))
+
+    def test_container_runner_rejects_mutable_images_and_unsafe_checks(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sha256 digest"):
+            ContainerSandboxRunner(image="python:3.12", engine="podman")
+        with self.assertRaisesRegex(ValueError, "argument vector"):
+            SandboxCheck("unsafe", ())
+
+    def test_sandbox_validation_is_connected_to_evolution_activation(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        runner = FakeSandboxRunner()
+        checks = (
+            SandboxCheck("unit", ("/validator/unit",)),
+            SandboxCheck("contract", ("/validator/contract",)),
+            SandboxCheck("security", ("/validator/security",)),
+        )
+        validator = SandboxCandidateValidator(SandboxOrchestrator(runner), checks)
+        candidate_handler = EchoTool()
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), candidate_handler),
+            registry.generation,
+            artifact=b"candidate-package-v1",
+            creator_id="magician-agent",
+        )
+
+        validated = engine.validate(proposal.proposal_id, validator)
+        approved = approve_proposal(engine, validated)
+        active = engine.activate(approved.proposal_id)
+
+        self.assertEqual(ProposalStatus.VALIDATED, validated.status)
+        self.assertEqual(("unit", "contract", "security"), validated.validation.checks)
+        self.assertEqual(3, len(runner.calls))
+        self.assertTrue(all(digest == proposal.artifact.sha256 for digest, _ in runner.calls))
+        self.assertEqual(ProposalStatus.ACTIVE, active.status)
+        self.assertEqual("1.1.0", registry.resolve("lookup").manifest.version)
+        self.assertIs(candidate_handler, registry.resolve("lookup").handler)
+
+    def test_sandbox_failure_blocks_candidate_approval_and_activation(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        runner = FakeSandboxRunner(exit_codes={"security": 19})
+        validator = SandboxCandidateValidator(
+            SandboxOrchestrator(runner),
+            (
+                SandboxCheck("unit", ("/validator/unit",)),
+                SandboxCheck("security", ("/validator/security",)),
+            ),
+        )
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate-with-security-failure",
+        )
+        rejected = engine.validate(proposal.proposal_id, validator)
+
+        self.assertEqual(ProposalStatus.REJECTED, rejected.status)
+        self.assertIn("security: exit code 19", rejected.validation.failures[0])
+        with self.assertRaises(ValueError):
+            approve_proposal(engine, rejected)
+        self.assertEqual("1.0.0", registry.resolve("lookup").manifest.version)
+
+
+    def test_container_runner_executes_real_isolated_validation_image(self) -> None:
+        image = os.getenv("PSYCHE_SANDBOX_IMAGE")
+        if not image:
+            self.skipTest("PSYCHE_SANDBOX_IMAGE is not configured")
+        runner = ContainerSandboxRunner(image=image, engine="docker")
+        artifact = InMemoryArtifactStore().put(
+            b"psyche-sandbox-fixture",
+            "application/octet-stream",
+        )
+        result = runner.run(
+            artifact,
+            SandboxCheck(
+                "container-security-fixture",
+                (
+                    "/usr/local/bin/python",
+                    "-B",
+                    "/opt/psyche/verify_artifact.py",
+                ),
+            ),
+        )
+        self.assertTrue(result.passed, result.stderr or result.stdout)
+        self.assertIn("network isolation verified", result.stdout)
+
+
+    def test_validator_must_return_a_report_with_a_validation_id(self) -> None:
+        class MissingReportValidator:
+            def validate(self, candidate: ToolBinding, artifact: ArtifactRecord):
+                return None
+
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"candidate-with-invalid-report",
+        )
+        with self.assertRaisesRegex(TypeError, "ValidationReport"):
+            engine.validate(proposal.proposal_id, MissingReportValidator())
+        self.assertEqual(ProposalStatus.FAILED, engine.get(proposal.proposal_id).status)
+
+    def test_sandbox_timeout_blocks_candidate(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        runner = FakeSandboxRunner(timeouts=frozenset({"integration"}))
+        validator = SandboxCandidateValidator(
+            SandboxOrchestrator(runner),
+            (SandboxCheck("integration", ("/validator/integration",)),),
+        )
+        proposal = engine.propose(
+            ToolBinding(make_manifest(version="1.1.0"), EchoTool()),
+            registry.generation,
+            artifact=b"timeout-candidate",
+        )
+
+        rejected = engine.validate(proposal.proposal_id, validator)
+        self.assertEqual(ProposalStatus.REJECTED, rejected.status)
+        self.assertEqual(("integration: timed out",), rejected.validation.failures)
+
+    def test_health_monitor_rolls_back_degraded_active_version(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        validated = create_validated_proposal(engine, registry)
+        approved = approve_proposal(engine, validated)
+        active = engine.activate(approved.proposal_id)
+        monitor = RuntimeHealthMonitor(
+            engine,
+            HealthThresholds(
+                max_error_rate=0.02,
+                max_p95_latency_ms=500,
+                max_contract_failures=0,
+            ),
+        )
+
+        healthy = monitor.observe(
+            active.proposal_id,
+            HealthSample(error_rate=0.001, p95_latency_ms=120, contract_failures=0),
+        )
+        degraded = monitor.observe(
+            active.proposal_id,
+            HealthSample(error_rate=0.20, p95_latency_ms=900, contract_failures=2),
+        )
+
+        self.assertEqual(HealthState.HEALTHY, healthy.state)
+        self.assertEqual(HealthState.RECOVERED, degraded.state)
+        self.assertEqual(ProposalStatus.ROLLED_BACK, engine.get(active.proposal_id).status)
+        self.assertEqual("1.0.0", registry.resolve("lookup").manifest.version)
+        self.assertTrue(degraded.recovery.succeeded)
+
+    def test_health_monitor_can_report_degradation_without_automatic_rollback(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ToolBinding(make_manifest(), EchoTool()))
+        engine = new_evolution_engine(registry)
+        validated = create_validated_proposal(engine, registry)
+        approved = approve_proposal(engine, validated)
+        active = engine.activate(approved.proposal_id)
+        monitor = RuntimeHealthMonitor(engine, auto_recover=False)
+
+        decision = monitor.observe(
+            active.proposal_id,
+            HealthSample(error_rate=0.50, p95_latency_ms=3_000, contract_failures=1),
+        )
+
+        self.assertEqual(HealthState.DEGRADED, decision.state)
+        self.assertEqual(ProposalStatus.ACTIVE, engine.get(active.proposal_id).status)
+        self.assertEqual("1.1.0", registry.resolve("lookup").manifest.version)
 
 
 class GuardAndArchetypeTests(unittest.TestCase):

@@ -14,6 +14,8 @@ from .artifacts import ArtifactRecord, ArtifactStore, InMemoryArtifactStore
 from .audit import AuditSink, InMemoryAuditLog
 from .models import AuditEvent, ValidationReport
 from .registry import ToolBinding, ToolRegistry
+from .loader import ArtifactLoader, PreparedArtifactLoader
+from .replay import InMemoryNonceStore, NonceStore
 
 
 class ProposalStatus(str, Enum):
@@ -110,6 +112,11 @@ def sign_evolution_approval(
         raise ValueError("approval requires an independent, authenticated approver")
     if proposal.validation is None or not proposal.validation.passed:
         raise ValueError("proposal must have a passing validation report")
+    if (
+        not isinstance(proposal.validation.validation_id, str)
+        or not proposal.validation.validation_id.strip()
+    ):
+        raise ValueError("validation report must have a non-empty validation ID")
     if proposal.validation.artifact_sha256 != proposal.artifact.sha256:
         raise ValueError("validation report does not match the stored candidate artifact")
     now = int(time.time()) if issued_at is None else issued_at
@@ -130,10 +137,11 @@ def sign_evolution_approval(
 
 
 class HmacEvolutionApprovalVerifier:
-    """Verifies approvals and consumes nonces once within this process.
+    """Verifies approvals and consumes each nonce through an injected replay store.
 
-    Production must authenticate approvers before token issuance and use a shared,
-    durable nonce store so replay protection spans processes and restarts.
+    InMemoryNonceStore is the default for tests. Production should inject SQLiteNonceStore
+    for one host or a shared transactional NonceStore for multi-host deployments.
+    The trusted approval gateway must authenticate the human before token issuance.
     """
 
     def __init__(
@@ -142,6 +150,7 @@ class HmacEvolutionApprovalVerifier:
         *,
         clock: Callable[[], float] = time.time,
         max_lifetime_seconds: int = 900,
+        nonce_store: NonceStore | None = None,
     ) -> None:
         if len(secret) < 32:
             raise ValueError("approval secret must contain at least 32 bytes")
@@ -150,8 +159,7 @@ class HmacEvolutionApprovalVerifier:
         self._secret = secret
         self._clock = clock
         self._max_lifetime = max_lifetime_seconds
-        self._used_nonces: set[str] = set()
-        self._lock = RLock()
+        self._nonce_store = nonce_store or InMemoryNonceStore()
 
     def verify(self, proposal: EvolutionProposal, approval: EvolutionApproval) -> bool:
         report = proposal.validation
@@ -163,6 +171,8 @@ class HmacEvolutionApprovalVerifier:
             or approval.artifact_sha256 != proposal.artifact.sha256
             or approval.validation_id != report.validation_id
             or report.artifact_sha256 != proposal.artifact.sha256
+            or not isinstance(report.validation_id, str)
+            or not report.validation_id.strip()
             or not approval.approver_id
             or approval.approver_id == proposal.created_by
         ):
@@ -177,11 +187,7 @@ class HmacEvolutionApprovalVerifier:
         ).hexdigest()
         if not hmac.compare_digest(expected, approval.signature):
             return False
-        with self._lock:
-            if approval.nonce in self._used_nonces:
-                return False
-            self._used_nonces.add(approval.nonce)
-        return True
+        return self._nonce_store.consume(approval.nonce, approval.expires_at, now)
 
 
 class EvolutionaryEngine:
@@ -227,10 +233,12 @@ class EvolutionaryEngine:
         *,
         artifact_store: ArtifactStore | None = None,
         approval_verifier: EvolutionApprovalVerifier | None = None,
+        artifact_loader: ArtifactLoader | None = None,
         audit: AuditSink | None = None,
     ) -> None:
         self.registry = registry
         self.artifact_store = artifact_store or InMemoryArtifactStore()
+        self.artifact_loader = artifact_loader or PreparedArtifactLoader(self.artifact_store)
         self.approval_verifier = approval_verifier
         self.audit = audit or InMemoryAuditLog()
         self._proposals: dict[str, EvolutionProposal] = {}
@@ -264,6 +272,7 @@ class EvolutionaryEngine:
         stored_artifact = self.artifact_store.put(artifact, media_type)
         if not stored_artifact.verify():
             raise RuntimeError("artifact store returned an invalid artifact")
+        self.artifact_loader.stage(stored_artifact, replacement)
         proposal = EvolutionProposal(
             proposal_id=secrets.token_urlsafe(18),
             replacement=replacement,
@@ -308,6 +317,13 @@ class EvolutionaryEngine:
             if stored.content != proposal.artifact.content or not stored.verify():
                 raise RuntimeError("candidate artifact changed after proposal creation")
             report = validator.validate(proposal.replacement, stored)
+            if not isinstance(report, ValidationReport):
+                raise TypeError("candidate validator must return a ValidationReport")
+            if (
+                not isinstance(report.validation_id, str)
+                or not report.validation_id.strip()
+            ):
+                raise ValueError("validation report must contain a non-empty validation ID")
         except Exception:
             with self._lock:
                 current = self._proposals[proposal_id]
@@ -412,8 +428,13 @@ class EvolutionaryEngine:
             stored = self.artifact_store.get(proposal.artifact.sha256)
             if not stored.verify() or stored.content != proposal.artifact.content:
                 raise RuntimeError("candidate artifact failed integrity verification")
+            prepared_binding = self.artifact_loader.load(proposal.artifact.sha256)
+            if prepared_binding.manifest != proposal.replacement.manifest:
+                raise RuntimeError(
+                    "prepared handler manifest does not match the approved candidate"
+                )
             new_generation = self.registry.replace(
-                proposal.replacement,
+                prepared_binding,
                 expected_generation=proposal.expected_generation,
             )
         except Exception:

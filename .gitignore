@@ -11,3 +11,11 @@ dist/
 build/
 *.egg-info/
 .coverage
+
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+var/

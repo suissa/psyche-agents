@@ -6,7 +6,7 @@ The action allowlist is empty by default. The runtime denies unknown actions, un
 
 A manifest marks each capability as read-only, write or financial. Financial handlers require approval even if their manifest is misconfigured to omit the explicit approval flag.
 
-The HMAC approval token is bound to the intent identifier and includes an approver identifier, expiry, nonce and signature. The verifier rejects expired tokens, rejects an approver who is the same identity as the initiating actor and rejects nonce reuse within the current process. The approval secret must be at least 256 bits and must remain in a trusted service boundary. The included nonce cache is in-memory; production deployments must replace it with a durable, shared, atomic one-time nonce store.
+The HMAC approval token is bound to the intent identifier and includes an approver identifier, expiry, nonce and signature. The verifier rejects expired tokens, rejects an approver who is the same identity as the initiating actor and rejects nonce reuse. The approval secret must be at least 256 bits and must remain in a trusted service boundary. HmacEvolutionApprovalVerifier accepts an injected NonceStore: SQLiteNonceStore provides durable atomic replay prevention across processes on one host; multi-host deployments require a shared transactional store. The identity gateway must authenticate the approver before signing.
 
 The actor identity supplied to the runtime must come from an authenticated server-side session, never from an untrusted prompt or client field.
 
@@ -15,6 +15,12 @@ The actor identity supplied to the runtime must come from an authenticated serve
 The Zig module exposes psyche_scan_input through a C ABI and reports two signal classes: a small set of instruction-override phrases and disallowed control bytes. The Python fallback mirrors these checks.
 
 The scanner evaluates both raw input and a canonical representation of the structured intent payload. This is a pre-filter, not a parser, semantic classifier or proof of safety. It can produce false positives and false negatives. It cannot reliably detect encoded, multilingual, contextual, indirect or novel prompt injection. Do not treat a zero result as authorization. All actions still require deterministic policy evaluation.
+
+## Sandboxed evolution validation
+
+Candidate validation runs through a digest-pinned Docker/Podman image with no network, read-only root filesystem and artifact mount, all capabilities dropped, no-new-privileges, numeric non-root user, bounded memory/CPU/PIDs/time/output and a noexec temporary filesystem. Rootless Podman is recommended. The host container engine and its daemon remain a trusted boundary. CI builds and runs a small local fixture image to verify actual candidate readability, read-only root filesystem, zero Linux capabilities, no-new-privileges and network isolation. Production must independently review and pin its own validation image.
+
+SQLiteArtifactStore persists immutable artifact bytes and verifies size plus SHA-256 on every read. The database is intended for a local durable filesystem; do not place it on an unreliable network filesystem. The default audit sink and proposal/handler catalogs remain in memory.
 
 ## Side effects and replay
 
@@ -32,6 +38,7 @@ The Shadow agent operates on the Superego gate only. Add isolated integration te
 - durable, tamper-evident audit storage and retention controls;
 - durable, shared anti-replay nonce storage;
 - schema validation and domain invariants for every tool;
+- production container image, rootless engine configuration and independent sandbox threat review;
 - process/container isolation for model inference and candidate testing;
 - secrets management, rotation and least-privilege credentials;
 - rate limits, quotas, timeouts and resource ceilings;
