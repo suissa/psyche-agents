@@ -243,6 +243,7 @@ class ReleaseExecutionTests(unittest.TestCase):
                 expected_generation=0,
                 version="1.1.0",
                 artifact=bad,
+                attestation=self.attestation,
                 idempotency_key="bad-artifact",
             )
         self.assertEqual(0, self.coordinator.get("payments-api").generation)
