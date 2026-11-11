@@ -6,6 +6,7 @@ from typing import Protocol
 
 from .artifacts import ArtifactRecord
 from .release import (
+    IdempotencyConflict,
     LeaseLost,
     ReleaseCoordinator,
     ReleaseLease,
@@ -236,24 +237,55 @@ class ReleaseExecutionService:
             or ttl_seconds <= 0
         ):
             raise ValueError("lease TTL must be a finite positive number")
-        if not isinstance(artifact, ArtifactRecord) or not artifact.content:
-            raise ValueError("deployment requires a non-empty ArtifactRecord")
         if (
-            not artifact.verify()
+            not isinstance(artifact, ArtifactRecord)
+            or not isinstance(artifact.content, bytes)
+            or not artifact.content
+            or not isinstance(artifact.sha256, str)
+            or not isinstance(artifact.size_bytes, int)
+            or isinstance(artifact.size_bytes, bool)
+            or artifact.size_bytes < 1
             or not isinstance(artifact.media_type, str)
             or not artifact.media_type.strip()
         ):
+            raise ValueError("deployment requires a valid non-empty ArtifactRecord")
+        try:
+            valid_artifact = artifact.verify()
+        except (TypeError, ValueError):
+            valid_artifact = False
+        if not valid_artifact:
             raise ValueError("deployment artifact failed integrity verification")
 
     def _inspect(self, target_id: str) -> DeploymentReceipt | None:
         receipt = self.adapter.inspect(target_id)
-        if receipt is not None and not isinstance(receipt, DeploymentReceipt):
+        if receipt is None:
+            return None
+        if not isinstance(receipt, DeploymentReceipt):
             raise DeploymentDivergence("deployment adapter returned an invalid receipt")
+        required_strings = (
+            receipt.target_id,
+            receipt.owner_id,
+            receipt.version,
+            receipt.artifact_sha256,
+            receipt.idempotency_key,
+            receipt.deployment_id,
+        )
+        if (
+            not all(isinstance(value, str) and value.strip() for value in required_strings)
+            or not isinstance(receipt.generation, int)
+            or isinstance(receipt.generation, bool)
+            or receipt.generation < 1
+            or not isinstance(receipt.fencing_token, int)
+            or isinstance(receipt.fencing_token, bool)
+            or receipt.fencing_token < 1
+            or len(receipt.artifact_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in receipt.artifact_sha256)
+        ):
+            raise DeploymentDivergence("deployment adapter returned a malformed receipt")
         return receipt
 
     @staticmethod
-    def _idempotency_conflict() -> Exception:
-        from .release import IdempotencyConflict
+    def _idempotency_conflict() -> IdempotencyConflict:
         return IdempotencyConflict(
             "deployment idempotency key is already bound to another owner or payload"
         )
@@ -343,6 +375,7 @@ class ReleaseExecutionService:
             and receipt.artifact_sha256 == artifact_sha256
             and receipt.idempotency_key == idempotency_key
             and receipt.fencing_token == fencing_token
+            and isinstance(receipt.deployment_id, str)
             and bool(receipt.deployment_id.strip())
         )
 

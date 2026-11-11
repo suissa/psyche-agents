@@ -225,8 +225,55 @@ class ReleaseExecutionTests(unittest.TestCase):
 
     def test_stale_generation_is_rejected(self) -> None:
         self.execute()
+        next_content = b"different-next-release"
+        next_artifact = ArtifactRecord(
+            hashlib.sha256(next_content).hexdigest(),
+            len(next_content),
+            "application/octet-stream",
+            next_content,
+        )
         with self.assertRaises(StaleGeneration):
+            self.service.execute(
+                "payments-api",
+                "release-controller",
+                expected_generation=0,
+                version="1.2.0",
+                artifact=next_artifact,
+                idempotency_key="payments-api-1.2.0",
+                ttl_seconds=30,
+            )
+        self.assertEqual(1, self.adapter.deploy_calls)
+
+    def test_provider_rejects_reuse_of_idempotency_key_for_another_payload(self) -> None:
+        self.adapter.current["payments-api"] = DeploymentReceipt(
+            target_id="payments-api",
+            owner_id="release-controller",
+            generation=1,
+            version="9.9.9",
+            artifact_sha256=hashlib.sha256(b"other-payload").hexdigest(),
+            fencing_token=1,
+            idempotency_key="payments-api-1.1.0",
+            deployment_id="existing-deployment",
+        )
+        with self.assertRaises(IdempotencyConflict):
             self.execute()
+        self.assertEqual(0, self.coordinator.get("payments-api").generation)
+        self.assertEqual(0, self.adapter.deploy_calls)
+
+    def test_malformed_provider_receipt_fails_closed(self) -> None:
+        self.adapter.current["payments-api"] = DeploymentReceipt(
+            target_id="payments-api",
+            owner_id="release-controller",
+            generation=1,
+            version="1.1.0",
+            artifact_sha256=self.artifact.sha256,
+            fencing_token=1,
+            idempotency_key="payments-api-1.1.0",
+            deployment_id=None,
+        )
+        with self.assertRaises(DeploymentDivergence):
+            self.execute()
+        self.assertEqual(0, self.coordinator.get("payments-api").generation)
 
 
 if __name__ == "__main__":
