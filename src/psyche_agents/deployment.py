@@ -28,9 +28,12 @@ class DeploymentAdapter(Protocol):
     """Trusted provider integration; implementations own external fencing.
 
     deploy() must be idempotent for (target_id, idempotency_key), reject the same
-    key with different owner/payload, and enforce monotonic fencing tokens at the
-    actual deployment target. It must not execute arbitrary candidate source code.
-    inspect() returns the provider's currently effective deployment pointer.
+    key with different owner/payload using IdempotencyConflict, and enforce monotonic
+    fencing tokens at the actual deployment target. A stale fence must raise
+    DeploymentDivergence. Retrying the exact pending operation with a higher fence
+    must preserve its deployment_id while advancing the effective receipt's fence.
+    inspect() must return the provider's authoritative effective deployment pointer.
+    It must not execute arbitrary candidate source code.
     """
 
     def deploy(self, request: DeploymentRequest) -> DeploymentReceipt: ...
