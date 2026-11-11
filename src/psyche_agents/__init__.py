@@ -6,7 +6,7 @@ from .artifacts import (
     InMemoryArtifactStore,
     SQLiteArtifactStore,
 )
-from .audit import InMemoryAuditLog
+from .audit import AuditIntegrityError, InMemoryAuditLog, SQLiteAuditLog
 from .evolution import (
     EvolutionApproval,
     EvolutionProposal,
@@ -38,6 +38,16 @@ from .models import (
 from .policy import HmacApprovalVerifier, SecurityPolicy, sign_approval_token
 from .registry import ToolRegistry
 from .replay import InMemoryNonceStore, NonceStore, SQLiteNonceStore
+from .release import (
+    IdempotencyConflict,
+    LeaseBusy,
+    LeaseLost,
+    ReleaseCoordinator,
+    ReleaseLease,
+    ReleaseSnapshot,
+    SQLiteReleaseCoordinator,
+    StaleGeneration,
+)
 from .runtime import JsonIntentExtractor, PsycheRuntime
 from .sandbox import (
     ContainerSandboxRunner,
@@ -54,6 +64,7 @@ from .validation import (
 
 __all__ = [
     "ApprovalToken",
+    "AuditIntegrityError",
     "ArtifactLoader",
     "ArtifactRecord",
     "ArtifactStore",
@@ -72,6 +83,9 @@ __all__ = [
     "HmacEvolutionApprovalVerifier",
     "InMemoryArtifactStore",
     "InMemoryAuditLog",
+    "IdempotencyConflict",
+    "LeaseBusy",
+    "LeaseLost",
     "InMemoryNonceStore",
     "Intent",
     "JsonIntentExtractor",
@@ -81,8 +95,14 @@ __all__ = [
     "PsycheRuntime",
     "RecoveryController",
     "RecoveryResult",
+    "ReleaseCoordinator",
+    "ReleaseLease",
+    "ReleaseSnapshot",
     "RuntimeHealthMonitor",
     "SQLiteArtifactStore",
+    "SQLiteAuditLog",
+    "SQLiteReleaseCoordinator",
+    "StaleGeneration",
     "SQLiteNonceStore",
     "SandboxCandidateValidator",
     "SandboxCheck",

@@ -79,3 +79,48 @@ The ArtifactStore and optional nonce store have SQLite implementations. Evolutio
 - The trusted build/loader pipeline must prepare the handler for the exact candidate artifact.
 - The container daemon and pinned validation image are trusted computing-base components.
 - The engine swaps an already-prepared ToolBinding; a complete source-to-binary build and release pipeline is not supplied.
+
+
+## Durable audit and release coordination
+
+Pass `SQLiteAuditLog` as the engine's `audit` sink to preserve proposal creation and lifecycle transitions across process restarts:
+
+```python
+audit = SQLiteAuditLog("./var/psyche-audit.sqlite3")
+engine = EvolutionaryEngine(registry, audit=audit)
+
+# Periodically export this tuple to a separately controlled system.
+sequence, chain_head = audit.checkpoint()
+if not audit.verify_chain():
+    raise RuntimeError("evolution audit integrity check failed")
+```
+
+The audit sink stores canonical JSON records in an append-only table. Each entry hashes the preceding entry and its own payload. Concurrent writers serialize through SQLite's `BEGIN IMMEDIATE` transaction. The checkpoint (sequence and chain head) should be exported to a separately controlled immutable store; without an external anchor, an administrator able to rewrite the entire database can recompute the chain. SQLite WAL and FULL synchronous mode are enabled, and the database file is restricted to owner access where the filesystem supports POSIX permissions.
+
+The release boundary is represented by the `ReleaseCoordinator` protocol. `SQLiteReleaseCoordinator` provides a durable implementation with:
+
+- per-target exclusive leases and monotonic fencing tokens;
+- lease renewal and explicit release;
+- generation-based compare-and-swap before publishing a new release record;
+- idempotency keys that return the original result for an identical retry and reject key reuse with a different payload;
+- a hash-chained release event log written in the same transaction as lease and release state.
+
+Example:
+
+```python
+coordinator = SQLiteReleaseCoordinator("./var/releases.sqlite3")
+lease = coordinator.acquire("payments-api", "release-controller-1", ttl_seconds=30)
+snapshot = coordinator.commit(
+    lease,
+    expected_generation=0,
+    version="1.1.0",
+    artifact_sha256="<sha256-of-trusted-prepared-artifact>",
+    idempotency_key="payments-api-1.1.0",
+)
+```
+
+A fencing token prevents a worker whose lease expired or was superseded from committing after a newer worker has acquired the target. Generation CAS prevents publishing against a state that changed after it was read. The idempotency key handles retries after an uncertain response; reusing it for a different owner or release payload fails.
+
+**Deployment boundary:** this SQLite coordinator supports multiple processes sharing one durable local database and filesystem. It is not a multi-host consensus system, and SQLite over NFS or an unreliable network filesystem is not supported. Multi-host deployment must provide a server-backed implementation of `ReleaseCoordinator` with transactional lease/fencing and generation-CAS semantics. The `EvolutionaryEngine` still performs an in-process `ToolRegistry` swap; an application release adapter must connect the coordinator to its actual deployment/routing system. It must not treat a coordinator record as proof that code was built, signed or deployed.
+
+Proposal history can be made durable immediately by injecting `SQLiteAuditLog`; prepared handlers and active in-process bindings still need a trusted bootstrap/catalog on restart. The audit log is a durable event history, not a serializer for Python handler objects.

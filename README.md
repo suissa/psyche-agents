@@ -103,3 +103,12 @@ Example configuration:
 The GitHub Actions workflow builds a small local validator fixture and runs an actual container integration test that verifies candidate readability, read-only root filesystem, zero Linux capabilities, no-new-privileges and disabled networking.
 
 SQLite stores are intended for a local durable filesystem. Multi-host production should inject object storage and a shared transactional nonce store. Evolution proposal state, the prepared-handler catalog and the default audit sink remain in memory; distributed activation and durable audit are not implemented yet.
+
+
+## Durable evolution history and release coordination
+
+`SQLiteAuditLog` is a durable audit sink for proposal lifecycle events. It stores canonical records in a SHA-256 hash chain and supports integrity verification plus externally anchorable checkpoints. Supply it as `EvolutionaryEngine(..., audit=SQLiteAuditLog(path))`.
+
+`ReleaseCoordinator` defines the release boundary. Its `SQLiteReleaseCoordinator` implementation provides per-target leases, monotonic fencing tokens, generation CAS, idempotent retries and a transactionally written release event chain. This implementation coordinates multiple processes on one host using a durable local filesystem. A multi-host deployment needs a server-backed adapter implementing the same protocol; SQLite on a shared network filesystem is not a distributed lock service.
+
+The release coordinator records deployment metadata only. It does not build, sign, upload or deploy executable artifacts, and it does not turn the engine's in-process registry swap into a distributed rollout. Those steps remain explicit trusted integration boundaries.
