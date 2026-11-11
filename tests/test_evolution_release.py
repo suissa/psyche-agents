@@ -152,6 +152,13 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
             "application/octet-stream",
             content,
         )
+        previous_content = b"trusted-previous-release-artifact"
+        self.previous_artifact = ArtifactRecord(
+            hashlib.sha256(previous_content).hexdigest(),
+            len(previous_content),
+            "application/octet-stream",
+            previous_content,
+        )
         self.adapter = FakeDeploymentAdapter()
         self.coordinator = SQLiteReleaseCoordinator(self.root / "releases.sqlite3")
         self.provenance_secret = b"evolution-provenance-secret-at-least-32-bytes"
@@ -168,6 +175,16 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
         self.provenance_verifier = HmacArtifactProvenanceVerifier(
             self.provenance_secret,
             trusted_builders={"trusted-ci"},
+        )
+        self.previous_attestation = sign_artifact_attestation(
+            self.provenance_secret,
+            self.previous_artifact,
+            target_id="catalog-service",
+            version="1.0.0",
+            builder_id="trusted-ci",
+            build_id="catalog-previous-build-001",
+            source_revision="f" * 40,
+            issued_at=int(time.time()),
         )
 
     def tearDown(self) -> None:
@@ -351,6 +368,169 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
         self.assertEqual(ProposalStatus.APPROVED, engine.get(proposal_id).status)
         self.assertEqual(0, self.coordinator.get("catalog-service").generation)
         self.assertEqual(0, self.adapter.calls)
+
+    def test_provider_rollback_publishes_previous_artifact_and_is_idempotent(self) -> None:
+        registry = self.registry()
+        engine = self.new_engine(registry)
+        proposal_id = self.approved_proposal(engine)
+        active = engine.activate_with_release(
+            proposal_id,
+            self.service(),
+            target_id="catalog-service",
+            owner_id="release-controller",
+            attestation=self.attestation,
+            ttl_seconds=30,
+        )
+        self.assertEqual(ProposalStatus.ACTIVE, active.status)
+
+        rolled_back = engine.rollback_with_release(
+            proposal_id,
+            self.service(),
+            previous_artifact=self.previous_artifact,
+            attestation=self.previous_attestation,
+            ttl_seconds=30,
+        )
+
+        snapshot = self.coordinator.get("catalog-service")
+        receipt = self.adapter.inspect("catalog-service")
+        self.assertEqual(ProposalStatus.ROLLED_BACK, rolled_back.status)
+        self.assertEqual(2, rolled_back.rollback_generation)
+        self.assertEqual(2, rolled_back.rollback_fencing_token)
+        self.assertEqual(1, rolled_back.release_generation)
+        self.assertEqual(2, snapshot.generation)
+        self.assertEqual("1.0.0", snapshot.version)
+        self.assertEqual(self.previous_artifact.sha256, snapshot.artifact_sha256)
+        self.assertEqual(rolled_back.rollback_generation, receipt.generation)
+        self.assertEqual("1.0.0", receipt.version)
+        self.assertEqual(rolled_back.rollback_fencing_token, receipt.fencing_token)
+        self.assertEqual(self.base.handler, registry.resolve("catalog_lookup").handler)
+        self.assertEqual(2, self.adapter.calls)
+
+        retried = engine.rollback_with_release(proposal_id, self.service())
+        self.assertEqual(ProposalStatus.ROLLED_BACK, retried.status)
+        self.assertEqual(2, self.adapter.calls)
+        self.assertEqual(self.base.handler, registry.resolve("catalog_lookup").handler)
+
+    def test_provider_rollback_recovers_provider_success_after_coordinator_failure(self) -> None:
+        registry = self.registry()
+        engine = self.new_engine(registry)
+        proposal_id = self.approved_proposal(engine)
+        engine.activate_with_release(
+            proposal_id,
+            self.service(),
+            target_id="catalog-service",
+            owner_id="release-controller",
+            attestation=self.attestation,
+            ttl_seconds=30,
+        )
+        failing_service = self.service(CommitFailOnceCoordinator(self.coordinator))
+
+        with self.assertRaisesRegex(RuntimeError, "simulated release coordinator commit failure"):
+            engine.rollback_with_release(
+                proposal_id,
+                failing_service,
+                previous_artifact=self.previous_artifact,
+                attestation=self.previous_attestation,
+                ttl_seconds=30,
+            )
+
+        interrupted = engine.get(proposal_id)
+        pending_receipt = self.adapter.inspect("catalog-service")
+        self.assertEqual(ProposalStatus.ROLLING_BACK, interrupted.status)
+        self.assertEqual(1, self.coordinator.get("catalog-service").generation)
+        self.assertEqual(2, pending_receipt.generation)
+        self.assertEqual("1.0.0", pending_receipt.version)
+        self.assertEqual(self.candidate.handler, registry.resolve("catalog_lookup").handler)
+
+        restarted_registry = self.registry(candidate_active=True)
+        restarted_engine = self.new_engine(restarted_registry)
+        recovered = restarted_engine.get(proposal_id)
+        self.assertEqual(ProposalStatus.ROLLING_BACK, recovered.status)
+        self.assertEqual(self.previous_attestation, recovered.rollback_attestation)
+
+        rolled_back = restarted_engine.rollback_with_release(
+            proposal_id,
+            self.service(),
+            ttl_seconds=30,
+        )
+        final_receipt = self.adapter.inspect("catalog-service")
+        self.assertEqual(ProposalStatus.ROLLED_BACK, rolled_back.status)
+        self.assertEqual(2, rolled_back.rollback_generation)
+        self.assertEqual(3, rolled_back.rollback_fencing_token)
+        self.assertEqual(2, self.coordinator.get("catalog-service").generation)
+        self.assertEqual(pending_receipt.deployment_id, final_receipt.deployment_id)
+        self.assertEqual(3, self.adapter.calls)
+        self.assertEqual(self.base.handler, restarted_registry.resolve("catalog_lookup").handler)
+
+    def test_provider_rollback_recovers_after_local_registry_swap_failure(self) -> None:
+        registry = self.registry()
+        engine = self.new_engine(registry)
+        proposal_id = self.approved_proposal(engine)
+        engine.activate_with_release(
+            proposal_id,
+            self.service(),
+            target_id="catalog-service",
+            owner_id="release-controller",
+            attestation=self.attestation,
+            ttl_seconds=30,
+        )
+        original_replace = registry.replace
+
+        def unavailable_registry(*args, **kwargs):
+            raise RuntimeError("simulated local rollback registry failure")
+
+        registry.replace = unavailable_registry
+        with self.assertRaisesRegex(RuntimeError, "simulated local rollback registry failure"):
+            engine.rollback_with_release(
+                proposal_id,
+                self.service(),
+                previous_artifact=self.previous_artifact,
+                attestation=self.previous_attestation,
+                ttl_seconds=30,
+            )
+        registry.replace = original_replace
+
+        self.assertEqual(ProposalStatus.ROLLING_BACK, engine.get(proposal_id).status)
+        self.assertEqual(2, self.coordinator.get("catalog-service").generation)
+        self.assertEqual(2, self.adapter.calls)
+
+        restarted_registry = self.registry(candidate_active=True)
+        restarted_engine = self.new_engine(restarted_registry)
+        rolled_back = restarted_engine.rollback_with_release(
+            proposal_id,
+            self.service(),
+        )
+        self.assertEqual(ProposalStatus.ROLLED_BACK, rolled_back.status)
+        self.assertEqual(2, self.adapter.calls)
+        self.assertEqual(self.base.handler, restarted_registry.resolve("catalog_lookup").handler)
+
+    def test_provider_rollback_rejects_wrong_previous_artifact_attestation(self) -> None:
+        registry = self.registry()
+        engine = self.new_engine(registry)
+        proposal_id = self.approved_proposal(engine)
+        engine.activate_with_release(
+            proposal_id,
+            self.service(),
+            target_id="catalog-service",
+            owner_id="release-controller",
+            attestation=self.attestation,
+            ttl_seconds=30,
+        )
+        invalid = replace(self.previous_attestation, signature="0" * 64)
+
+        with self.assertRaises(ArtifactProvenanceError):
+            engine.rollback_with_release(
+                proposal_id,
+                self.service(),
+                previous_artifact=self.previous_artifact,
+                attestation=invalid,
+                ttl_seconds=30,
+            )
+
+        self.assertEqual(ProposalStatus.ACTIVE, engine.get(proposal_id).status)
+        self.assertEqual(1, self.coordinator.get("catalog-service").generation)
+        self.assertEqual(self.candidate.handler, registry.resolve("catalog_lookup").handler)
+        self.assertEqual(1, self.adapter.calls)
 
     def test_release_aware_proposal_rejects_local_only_rollback(self) -> None:
         registry = self.registry()

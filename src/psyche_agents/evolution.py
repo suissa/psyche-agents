@@ -82,6 +82,14 @@ class EvolutionProposal:
     release_generation: int | None = None
     release_fencing_token: int | None = None
     release_attestation: ArtifactAttestation | None = None
+    rollback_artifact_sha256: str | None = None
+    rollback_artifact_size_bytes: int | None = None
+    rollback_artifact_media_type: str | None = None
+    rollback_expected_generation: int | None = None
+    rollback_idempotency_key: str | None = None
+    rollback_generation: int | None = None
+    rollback_fencing_token: int | None = None
+    rollback_attestation: ArtifactAttestation | None = None
 
 
 class CandidateValidator(Protocol):
@@ -671,6 +679,190 @@ class EvolutionaryEngine:
                 local_registry_generation=local_generation,
             )
 
+    def rollback_with_release(
+        self,
+        proposal_id: str,
+        release_service: ReleaseExecutionService,
+        *,
+        previous_artifact: ArtifactRecord | None = None,
+        attestation: ArtifactAttestation | None = None,
+        ttl_seconds: float = 60.0,
+    ) -> EvolutionProposal:
+        """Roll back the provider and local registry using a separately attested old artifact.
+
+        The previous immutable artifact and its provenance are persisted before the
+        provider side effect. Provider/coordinator failures leave the proposal in
+        ROLLING_BACK so the same operation can be resumed after restart.
+        """
+        with self._lock:
+            proposal = self._proposals[proposal_id]
+            if proposal.status is ProposalStatus.ACTIVE:
+                if (
+                    proposal.release_target_id is None
+                    or proposal.release_owner_id is None
+                    or proposal.release_generation is None
+                    or proposal.release_fencing_token is None
+                ):
+                    raise RuntimeError("provider rollback requires a completed external release")
+                if previous_artifact is None or attestation is None:
+                    raise ValueError(
+                        "provider rollback requires the immutable previous artifact and its attestation"
+                    )
+                stored_previous = self.artifact_store.put(
+                    previous_artifact.content,
+                    previous_artifact.media_type,
+                )
+                if stored_previous != previous_artifact or not stored_previous.verify():
+                    raise RuntimeError("previous rollback artifact was not stored exactly")
+                release_service.verify_provenance(
+                    stored_previous,
+                    target_id=proposal.release_target_id,
+                    version=proposal.previous_binding.manifest.version,
+                    attestation=attestation,
+                )
+                current_release = release_service.coordinator.get(proposal.release_target_id)
+                if (
+                    current_release.generation != proposal.release_generation
+                    or current_release.version != proposal.replacement.manifest.version
+                    or current_release.artifact_sha256 != proposal.artifact.sha256
+                    or current_release.fencing_token != proposal.release_fencing_token
+                ):
+                    raise RuntimeError(
+                        "provider release changed since this proposal was activated; refusing rollback"
+                    )
+                rollback_key = f"psyche-evolution-rollback:{proposal.proposal_id}"
+                proposal = replace(
+                    proposal,
+                    rollback_artifact_sha256=stored_previous.sha256,
+                    rollback_artifact_size_bytes=stored_previous.size_bytes,
+                    rollback_artifact_media_type=stored_previous.media_type,
+                    rollback_expected_generation=current_release.generation,
+                    rollback_idempotency_key=rollback_key,
+                    rollback_attestation=attestation,
+                )
+                proposal = self._transition(
+                    proposal,
+                    ProposalStatus.ROLLING_BACK,
+                    rollback_expected_generation=current_release.generation,
+                    rollback_idempotency_key=rollback_key,
+                    rollback_artifact_sha256=stored_previous.sha256,
+                    rollback_builder_id=attestation.builder_id,
+                    rollback_build_id=attestation.build_id,
+                    rollback_source_revision=attestation.source_revision,
+                )
+            elif proposal.status in (
+                ProposalStatus.ROLLING_BACK,
+                ProposalStatus.ROLLED_BACK,
+            ):
+                if (
+                    proposal.release_target_id is None
+                    or proposal.release_owner_id is None
+                    or proposal.rollback_artifact_sha256 is None
+                    or proposal.rollback_artifact_size_bytes is None
+                    or proposal.rollback_artifact_media_type is None
+                    or proposal.rollback_expected_generation is None
+                    or proposal.rollback_idempotency_key
+                    != f"psyche-evolution-rollback:{proposal.proposal_id}"
+                    or proposal.rollback_attestation is None
+                ):
+                    raise RuntimeError("persisted provider rollback intent is incomplete")
+                if previous_artifact is not None:
+                    stored_previous = self.artifact_store.put(
+                        previous_artifact.content,
+                        previous_artifact.media_type,
+                    )
+                    if (
+                        stored_previous.sha256 != proposal.rollback_artifact_sha256
+                        or stored_previous.size_bytes != proposal.rollback_artifact_size_bytes
+                        or stored_previous.media_type != proposal.rollback_artifact_media_type
+                    ):
+                        raise RuntimeError("previous rollback artifact differs from persisted intent")
+                else:
+                    stored_previous = self.artifact_store.get(proposal.rollback_artifact_sha256)
+                if attestation is not None and attestation != proposal.rollback_attestation:
+                    raise RuntimeError("provider rollback cannot substitute its persisted attestation")
+                attestation = proposal.rollback_attestation
+            else:
+                raise RuntimeError(
+                    f"proposal must be active or awaiting provider rollback recovery, got {proposal.status.value}"
+                )
+
+        assert proposal.release_target_id is not None
+        assert proposal.release_owner_id is not None
+        assert proposal.rollback_expected_generation is not None
+        assert proposal.rollback_idempotency_key is not None
+        assert proposal.rollback_attestation is not None
+        if (
+            stored_previous.size_bytes != proposal.rollback_artifact_size_bytes
+            or stored_previous.media_type != proposal.rollback_artifact_media_type
+            or not stored_previous.verify()
+        ):
+            raise RuntimeError("persisted previous rollback artifact failed integrity verification")
+        release_service.verify_provenance(
+            stored_previous,
+            target_id=proposal.release_target_id,
+            version=proposal.previous_binding.manifest.version,
+            attestation=proposal.rollback_attestation,
+        )
+        snapshot = release_service.execute(
+            proposal.release_target_id,
+            proposal.release_owner_id,
+            expected_generation=proposal.rollback_expected_generation,
+            version=proposal.previous_binding.manifest.version,
+            artifact=stored_previous,
+            attestation=proposal.rollback_attestation,
+            idempotency_key=proposal.rollback_idempotency_key,
+            ttl_seconds=ttl_seconds,
+        )
+        if (
+            snapshot.target_id != proposal.release_target_id
+            or snapshot.generation != proposal.rollback_expected_generation + 1
+            or snapshot.version != proposal.previous_binding.manifest.version
+            or snapshot.artifact_sha256 != proposal.rollback_artifact_sha256
+            or snapshot.fencing_token < 1
+        ):
+            raise RuntimeError("provider rollback receipt does not match the persisted rollback intent")
+
+        with self._lock:
+            current_binding = self.registry.resolve(proposal.previous_binding.manifest.action)
+            if self._same_active_binding(proposal.previous_binding, current_binding):
+                local_generation = self.registry.generation
+            elif self._same_active_binding(proposal.replacement, current_binding):
+                local_generation = self.registry.replace(
+                    proposal.previous_binding,
+                    expected_generation=self.registry.generation,
+                )
+            else:
+                raise RuntimeError(
+                    "provider rollback succeeded but local registry contains an unknown handler; "
+                    "restore the trusted previous or candidate binding before retrying"
+                )
+
+            latest = self._proposals[proposal_id]
+            if latest.status is ProposalStatus.ROLLED_BACK:
+                if (
+                    latest.rollback_generation != snapshot.generation
+                    or latest.rollback_fencing_token != snapshot.fencing_token
+                    or latest.activation_generation != local_generation
+                ):
+                    raise RuntimeError("rolled-back proposal evidence does not match provider state")
+                return latest
+            if latest.status is not ProposalStatus.ROLLING_BACK:
+                raise RuntimeError("proposal state changed during provider rollback")
+            updated = replace(
+                latest,
+                activation_generation=local_generation,
+                rollback_generation=snapshot.generation,
+                rollback_fencing_token=snapshot.fencing_token,
+            )
+            return self._transition(
+                updated,
+                ProposalStatus.ROLLED_BACK,
+                rollback_generation=snapshot.generation,
+                rollback_fencing_token=snapshot.fencing_token,
+                local_registry_generation=local_generation,
+            )
+
     def rollback(self, proposal_id: str) -> EvolutionProposal:
         """Restore the previously active binding using CAS; never overwrite a newer change."""
         with self._lock:
@@ -745,6 +937,18 @@ class EvolutionaryEngine:
             "release_attestation": (
                 attestation_to_dict(proposal.release_attestation)
                 if proposal.release_attestation is not None
+                else None
+            ),
+            "rollback_artifact_sha256": proposal.rollback_artifact_sha256,
+            "rollback_artifact_size_bytes": proposal.rollback_artifact_size_bytes,
+            "rollback_artifact_media_type": proposal.rollback_artifact_media_type,
+            "rollback_expected_generation": proposal.rollback_expected_generation,
+            "rollback_idempotency_key": proposal.rollback_idempotency_key,
+            "rollback_generation": proposal.rollback_generation,
+            "rollback_fencing_token": proposal.rollback_fencing_token,
+            "rollback_attestation": (
+                attestation_to_dict(proposal.rollback_attestation)
+                if proposal.rollback_attestation is not None
                 else None
             ),
         }
@@ -831,6 +1035,21 @@ class EvolutionaryEngine:
                 if raw_release_attestation is not None
                 else None
             )
+            rollback_artifact_sha256 = payload.get("rollback_artifact_sha256")
+            rollback_artifact_size_bytes = payload.get("rollback_artifact_size_bytes")
+            rollback_artifact_media_type = payload.get("rollback_artifact_media_type")
+            rollback_expected_generation = payload.get("rollback_expected_generation")
+            rollback_idempotency_key = payload.get("rollback_idempotency_key")
+            rollback_generation = payload.get("rollback_generation")
+            rollback_fencing_token = payload.get("rollback_fencing_token")
+            raw_rollback_attestation = payload.get("rollback_attestation")
+            if raw_rollback_attestation is not None and not isinstance(raw_rollback_attestation, dict):
+                raise ValueError("persisted rollback attestation must be an object")
+            rollback_attestation = (
+                attestation_from_dict(raw_rollback_attestation)
+                if raw_rollback_attestation is not None
+                else None
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(f"persisted proposal metadata is invalid: {proposal_id}") from error
         if (
@@ -874,6 +1093,35 @@ class EvolutionaryEngine:
                 or isinstance(release_fencing_token, bool)
                 or release_fencing_token < 1
             ))
+            or (rollback_artifact_sha256 is not None and (
+                not isinstance(rollback_artifact_sha256, str) or not rollback_artifact_sha256.strip()
+            ))
+            or (rollback_artifact_size_bytes is not None and (
+                not isinstance(rollback_artifact_size_bytes, int)
+                or isinstance(rollback_artifact_size_bytes, bool)
+                or rollback_artifact_size_bytes < 1
+            ))
+            or (rollback_artifact_media_type is not None and (
+                not isinstance(rollback_artifact_media_type, str) or not rollback_artifact_media_type.strip()
+            ))
+            or (rollback_expected_generation is not None and (
+                not isinstance(rollback_expected_generation, int)
+                or isinstance(rollback_expected_generation, bool)
+                or rollback_expected_generation < 0
+            ))
+            or (rollback_idempotency_key is not None and (
+                not isinstance(rollback_idempotency_key, str) or not rollback_idempotency_key.strip()
+            ))
+            or (rollback_generation is not None and (
+                not isinstance(rollback_generation, int)
+                or isinstance(rollback_generation, bool)
+                or rollback_generation < 1
+            ))
+            or (rollback_fencing_token is not None and (
+                not isinstance(rollback_fencing_token, int)
+                or isinstance(rollback_fencing_token, bool)
+                or rollback_fencing_token < 1
+            ))
         ):
             raise RuntimeError(f"persisted proposal fields are invalid: {proposal_id}")
         release_intent_fields = (
@@ -889,9 +1137,14 @@ class EvolutionaryEngine:
         if (release_generation is None) != (release_fencing_token is None):
             raise RuntimeError("persisted release receipt metadata is incomplete")
         if release_generation is not None and (
-            release_target_id is None or status is not ProposalStatus.ACTIVE
+            release_target_id is None
+            or status not in {
+                ProposalStatus.ACTIVE,
+                ProposalStatus.ROLLING_BACK,
+                ProposalStatus.ROLLED_BACK,
+            }
         ):
-            raise RuntimeError("persisted release receipt is not attached to an active release proposal")
+            raise RuntimeError("persisted release receipt is not attached to an active or rollback lifecycle state")
         if status is ProposalStatus.ACTIVE and release_target_id is not None and release_generation is None:
             raise RuntimeError("active release proposal is missing its provider receipt")
         if release_target_id is not None and release_attestation is None:
@@ -903,6 +1156,55 @@ class EvolutionaryEngine:
             or release_attestation.artifact_sha256 != artifact_sha256
         ):
             raise RuntimeError("persisted artifact attestation does not match the release proposal")
+        rollback_fields = (
+            rollback_artifact_sha256,
+            rollback_artifact_size_bytes,
+            rollback_artifact_media_type,
+            rollback_expected_generation,
+            rollback_idempotency_key,
+            rollback_attestation,
+        )
+        if any(value is not None for value in rollback_fields) and not all(
+            value is not None for value in rollback_fields
+        ):
+            raise RuntimeError("persisted provider rollback intent is incomplete")
+        if (rollback_generation is None) != (rollback_fencing_token is None):
+            raise RuntimeError("persisted provider rollback receipt is incomplete")
+        if rollback_generation is not None and (
+            rollback_expected_generation is None
+            or rollback_generation != rollback_expected_generation + 1
+            or status is not ProposalStatus.ROLLED_BACK
+        ):
+            raise RuntimeError("persisted provider rollback receipt does not match its lifecycle state")
+        if rollback_expected_generation is not None and (
+            release_generation is None or rollback_expected_generation != release_generation
+        ):
+            raise RuntimeError("provider rollback generation does not match the activated release generation")
+        if status in (ProposalStatus.ROLLING_BACK, ProposalStatus.ROLLED_BACK) and release_target_id is not None:
+            if not all(value is not None for value in rollback_fields):
+                raise RuntimeError("release-aware rollback is missing its immutable intent")
+            if rollback_attestation.target_id != release_target_id:
+                raise RuntimeError("rollback attestation target does not match the provider release")
+            if rollback_attestation.version != previous_manifest.version:
+                raise RuntimeError("rollback attestation version does not match the previous handler")
+            if (
+                rollback_attestation.artifact_sha256 != rollback_artifact_sha256
+                or rollback_attestation.artifact_size_bytes != rollback_artifact_size_bytes
+                or rollback_attestation.artifact_media_type != rollback_artifact_media_type
+            ):
+                raise RuntimeError("rollback attestation does not match previous artifact metadata")
+            if rollback_generation is None and status is ProposalStatus.ROLLED_BACK:
+                raise RuntimeError("rolled-back provider proposal is missing its receipt")
+        if rollback_artifact_sha256 is not None:
+            if release_target_id is None or rollback_attestation is None:
+                raise RuntimeError("provider rollback evidence is missing its release target or attestation")
+            previous_artifact = self.artifact_store.get(rollback_artifact_sha256)
+            if (
+                not previous_artifact.verify()
+                or previous_artifact.size_bytes != rollback_artifact_size_bytes
+                or previous_artifact.media_type != rollback_artifact_media_type
+            ):
+                raise RuntimeError("persisted previous rollback artifact failed integrity verification")
         artifact = self.artifact_store.get(artifact_sha256)
         if (
             not artifact.verify()
@@ -993,6 +1295,14 @@ class EvolutionaryEngine:
             release_generation=release_generation,
             release_fencing_token=release_fencing_token,
             release_attestation=release_attestation,
+            rollback_artifact_sha256=rollback_artifact_sha256,
+            rollback_artifact_size_bytes=rollback_artifact_size_bytes,
+            rollback_artifact_media_type=rollback_artifact_media_type,
+            rollback_expected_generation=rollback_expected_generation,
+            rollback_idempotency_key=rollback_idempotency_key,
+            rollback_generation=rollback_generation,
+            rollback_fencing_token=rollback_fencing_token,
+            rollback_attestation=rollback_attestation,
         )
         if status in approval_required_statuses:
             verifier = self.approval_verifier
@@ -1055,6 +1365,9 @@ class EvolutionaryEngine:
                 )
             return
         if proposal.status is ProposalStatus.ROLLING_BACK:
+            if proposal.rollback_expected_generation is not None:
+                # Provider state must be reconciled through rollback_with_release().
+                return
             if self._same_active_binding(proposal.previous_binding, current):
                 recovered = replace(proposal, activation_generation=self.registry.generation)
                 self._transition(
