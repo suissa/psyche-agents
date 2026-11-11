@@ -230,3 +230,14 @@ The service verifies this evidence before reading coordinator state, acquiring a
 The reference `HmacArtifactProvenanceVerifier` uses an allowlist of builder IDs and a shared secret. A production build service should issue the attestation only after the artifact has been built from a reviewed source revision and passed the required validation pipeline. Production can replace the HMAC verifier with a registry-backed, keyless-signing or transparency-log verifier using the same protocol.
 
 Release-aware proposal activation stores the exact attestation before moving to `ACTIVATING`. The attestation is reloaded and compared on every retry, so a restart cannot substitute a different build identity or source revision for the previously approved artifact.
+
+
+## Deployment adapter conformance
+
+The reusable provider contract lives in `tests/deployment_adapter_contract.py`. It is a test mixin for any concrete `DeploymentAdapter`: subclass `DeploymentAdapterContract`, implement `create_adapter()` with an isolated provider test target, and let unittest run the inherited contract cases. The reference `FakeDeploymentAdapter` is tested through the same suite.
+
+The suite checks that receipts bind every release field and agree with authoritative inspection; exact retries preserve the deployment identity; an idempotency key cannot be rebound to another owner or payload; stale fencing tokens are rejected at the provider boundary; a higher fencing token can adopt the exact pending deployment without creating a second deployment; and idempotency keys are scoped to their target.
+
+Provider adapters must translate provider-specific errors into `IdempotencyConflict` for idempotency-key payload conflicts and `DeploymentDivergence` for stale fences or unsafe provider state. This gives the orchestration layer stable failure semantics while leaving the actual API calls provider-specific.
+
+The contract suite is necessary but not sufficient for production approval. Run it against an isolated instance of the real provider adapter, then add provider-specific integration tests for API consistency, asynchronous rollout states, restart recovery, credentials, timeouts and the platform's real fencing primitive. A fake adapter passing the suite does not prove that an external provider enforces fencing durably.
