@@ -13,6 +13,7 @@ from typing import Callable, Protocol
 from .artifacts import ArtifactRecord, ArtifactStore, InMemoryArtifactStore
 from .audit import AuditSink, InMemoryAuditLog
 from .deployment import ReleaseExecutionService
+from .provenance import ArtifactAttestation, attestation_from_dict, attestation_to_dict
 from .models import AuditEvent, ValidationReport
 from .registry import ToolBinding, ToolRegistry
 from .loader import ArtifactLoader, PreparedArtifactLoader, TrustedBindingResolver
@@ -80,6 +81,7 @@ class EvolutionProposal:
     release_idempotency_key: str | None = None
     release_generation: int | None = None
     release_fencing_token: int | None = None
+    release_attestation: ArtifactAttestation | None = None
 
 
 class CandidateValidator(Protocol):
@@ -521,6 +523,7 @@ class EvolutionaryEngine:
         *,
         target_id: str,
         owner_id: str,
+        attestation: ArtifactAttestation,
         ttl_seconds: float = 60.0,
     ) -> EvolutionProposal:
         """Deploy an approved proposal and activate its trusted local binding.
@@ -547,9 +550,16 @@ class EvolutionaryEngine:
                         proposal.release_idempotency_key,
                         proposal.release_generation,
                         proposal.release_fencing_token,
+                        proposal.release_attestation,
                     )
                 ):
                     raise RuntimeError("approved proposal already contains release metadata")
+                release_service.verify_provenance(
+                    proposal.artifact,
+                    target_id=target_id,
+                    version=proposal.replacement.manifest.version,
+                    attestation=attestation,
+                )
                 baseline = release_service.coordinator.get(target_id)
                 release_key = f"psyche-evolution:{proposal.proposal_id}"
                 proposal = replace(
@@ -558,6 +568,7 @@ class EvolutionaryEngine:
                     release_owner_id=owner_id,
                     release_expected_generation=baseline.generation,
                     release_idempotency_key=release_key,
+                    release_attestation=attestation,
                 )
                 proposal = self._transition(
                     proposal,
@@ -573,6 +584,7 @@ class EvolutionaryEngine:
                     or proposal.release_expected_generation is None
                     or proposal.release_idempotency_key
                     != f"psyche-evolution:{proposal.proposal_id}"
+                    or proposal.release_attestation != attestation
                 ):
                     raise RuntimeError(
                         "release activation can only resume with its persisted target, owner and idempotency key"
@@ -595,12 +607,14 @@ class EvolutionaryEngine:
         assert proposal.release_target_id is not None
         assert proposal.release_owner_id is not None
         assert proposal.release_idempotency_key is not None
+        assert proposal.release_attestation is not None
         snapshot = release_service.execute(
             proposal.release_target_id,
             proposal.release_owner_id,
             expected_generation=proposal.release_expected_generation,
             version=proposal.replacement.manifest.version,
             artifact=stored,
+            attestation=proposal.release_attestation,
             idempotency_key=proposal.release_idempotency_key,
             ttl_seconds=ttl_seconds,
         )
@@ -728,6 +742,11 @@ class EvolutionaryEngine:
             "release_idempotency_key": proposal.release_idempotency_key,
             "release_generation": proposal.release_generation,
             "release_fencing_token": proposal.release_fencing_token,
+            "release_attestation": (
+                attestation_to_dict(proposal.release_attestation)
+                if proposal.release_attestation is not None
+                else None
+            ),
         }
 
     def _persist_proposal(
@@ -804,6 +823,14 @@ class EvolutionaryEngine:
             release_idempotency_key = payload.get("release_idempotency_key")
             release_generation = payload.get("release_generation")
             release_fencing_token = payload.get("release_fencing_token")
+            raw_release_attestation = payload.get("release_attestation")
+            if raw_release_attestation is not None and not isinstance(raw_release_attestation, dict):
+                raise ValueError("persisted release attestation must be an object")
+            release_attestation = (
+                attestation_from_dict(raw_release_attestation)
+                if raw_release_attestation is not None
+                else None
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(f"persisted proposal metadata is invalid: {proposal_id}") from error
         if (
@@ -867,6 +894,15 @@ class EvolutionaryEngine:
             raise RuntimeError("persisted release receipt is not attached to an active release proposal")
         if status is ProposalStatus.ACTIVE and release_target_id is not None and release_generation is None:
             raise RuntimeError("active release proposal is missing its provider receipt")
+        if release_target_id is not None and release_attestation is None:
+            raise RuntimeError("release-aware proposal is missing its signed artifact attestation")
+        if release_attestation is not None and (
+            release_target_id is None
+            or release_attestation.target_id != release_target_id
+            or release_attestation.version != replacement_manifest.version
+            or release_attestation.artifact_sha256 != artifact_sha256
+        ):
+            raise RuntimeError("persisted artifact attestation does not match the release proposal")
         artifact = self.artifact_store.get(artifact_sha256)
         if (
             not artifact.verify()
@@ -956,6 +992,7 @@ class EvolutionaryEngine:
             release_idempotency_key=release_idempotency_key,
             release_generation=release_generation,
             release_fencing_token=release_fencing_token,
+            release_attestation=release_attestation,
         )
         if status in approval_required_statuses:
             verifier = self.approval_verifier

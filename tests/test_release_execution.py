@@ -18,6 +18,11 @@ from psyche_agents.release import (
     SQLiteReleaseCoordinator,
     StaleGeneration,
 )
+from psyche_agents.provenance import (
+    ArtifactProvenanceError,
+    HmacArtifactProvenanceVerifier,
+    sign_artifact_attestation,
+)
 
 
 class FakeClock:
@@ -103,6 +108,7 @@ class CommitFailOnceCoordinator:
 
 
 class ReleaseExecutionTests(unittest.TestCase):
+    PROVENANCE_SECRET = b"release-execution-provenance-secret-32-bytes"
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -112,13 +118,32 @@ class ReleaseExecutionTests(unittest.TestCase):
             clock=self.clock,
         )
         self.adapter = FakeDeploymentAdapter()
-        self.service = ReleaseExecutionService(self.coordinator, self.adapter)
         content = b"trusted-prepared-artifact"
         self.artifact = ArtifactRecord(
             hashlib.sha256(content).hexdigest(),
             len(content),
             "application/octet-stream",
             content,
+        )
+        self.attestation = sign_artifact_attestation(
+            self.PROVENANCE_SECRET,
+            self.artifact,
+            target_id="payments-api",
+            version="1.1.0",
+            builder_id="trusted-ci",
+            build_id="payments-build-001",
+            source_revision="c" * 40,
+            issued_at=1_000,
+        )
+        self.provenance_verifier = HmacArtifactProvenanceVerifier(
+            self.PROVENANCE_SECRET,
+            trusted_builders={"trusted-ci"},
+            clock=self.clock,
+        )
+        self.service = ReleaseExecutionService(
+            self.coordinator,
+            self.adapter,
+            provenance_verifier=self.provenance_verifier,
         )
 
     def tearDown(self) -> None:
@@ -131,6 +156,7 @@ class ReleaseExecutionTests(unittest.TestCase):
             expected_generation=expected_generation,
             version="1.1.0",
             artifact=self.artifact,
+            attestation=self.attestation,
             idempotency_key="payments-api-1.1.0",
             ttl_seconds=30,
         )
@@ -162,7 +188,11 @@ class ReleaseExecutionTests(unittest.TestCase):
 
     def test_recovers_provider_success_when_coordinator_commit_failed(self) -> None:
         failing = CommitFailOnceCoordinator(self.coordinator)
-        service = ReleaseExecutionService(failing, self.adapter)
+        service = ReleaseExecutionService(
+            failing,
+            self.adapter,
+            provenance_verifier=self.provenance_verifier,
+        )
         with self.assertRaisesRegex(RuntimeError, "simulated coordinator commit failure"):
             service.execute(
                 "payments-api",
@@ -170,6 +200,7 @@ class ReleaseExecutionTests(unittest.TestCase):
                 expected_generation=0,
                 version="1.1.0",
                 artifact=self.artifact,
+                attestation=self.attestation,
                 idempotency_key="payments-api-1.1.0",
                 ttl_seconds=30,
             )
@@ -183,6 +214,7 @@ class ReleaseExecutionTests(unittest.TestCase):
             expected_generation=0,
             version="1.1.0",
             artifact=self.artifact,
+            attestation=self.attestation,
             idempotency_key="payments-api-1.1.0",
             ttl_seconds=30,
         )
@@ -223,6 +255,22 @@ class ReleaseExecutionTests(unittest.TestCase):
         self.assertEqual(0, self.coordinator.get("payments-api").generation)
         self.assertTrue(self.coordinator.verify_event_chain())
 
+    def test_invalid_attestation_fails_before_provider_or_coordinator_mutation(self) -> None:
+        invalid = replace(self.attestation, signature="0" * 64)
+        with self.assertRaises(ArtifactProvenanceError):
+            self.service.execute(
+                "payments-api",
+                "release-controller",
+                expected_generation=0,
+                version="1.1.0",
+                artifact=self.artifact,
+                attestation=invalid,
+                idempotency_key="bad-provenance",
+                ttl_seconds=30,
+            )
+        self.assertEqual(0, self.coordinator.get("payments-api").generation)
+        self.assertEqual(0, self.adapter.deploy_calls)
+
     def test_stale_generation_is_rejected(self) -> None:
         self.execute()
         next_content = b"different-next-release"
@@ -239,6 +287,16 @@ class ReleaseExecutionTests(unittest.TestCase):
                 expected_generation=0,
                 version="1.2.0",
                 artifact=next_artifact,
+                attestation=sign_artifact_attestation(
+                    self.PROVENANCE_SECRET,
+                    next_artifact,
+                    target_id="payments-api",
+                    version="1.2.0",
+                    builder_id="trusted-ci",
+                    build_id="payments-build-002",
+                    source_revision="d" * 40,
+                    issued_at=1_000,
+                ),
                 idempotency_key="payments-api-1.2.0",
                 ttl_seconds=30,
             )

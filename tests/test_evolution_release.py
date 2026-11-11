@@ -24,6 +24,11 @@ from psyche_agents.models import SideEffect, ToolManifest, ValidationReport
 from psyche_agents.persistence import SQLiteEvolutionJournal, SQLitePreparedArtifactCatalog
 from psyche_agents.registry import ToolBinding, ToolRegistry
 from psyche_agents.release import IdempotencyConflict, SQLiteReleaseCoordinator
+from psyche_agents.provenance import (
+    ArtifactProvenanceError,
+    HmacArtifactProvenanceVerifier,
+    sign_artifact_attestation,
+)
 
 
 SECRET = b"release-aware-evolution-secret-32-bytes"
@@ -149,6 +154,21 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
         )
         self.adapter = FakeDeploymentAdapter()
         self.coordinator = SQLiteReleaseCoordinator(self.root / "releases.sqlite3")
+        self.provenance_secret = b"evolution-provenance-secret-at-least-32-bytes"
+        self.attestation = sign_artifact_attestation(
+            self.provenance_secret,
+            self.artifact,
+            target_id="catalog-service",
+            version="1.1.0",
+            builder_id="trusted-ci",
+            build_id="catalog-build-001",
+            source_revision="e" * 40,
+            issued_at=int(time.time()),
+        )
+        self.provenance_verifier = HmacArtifactProvenanceVerifier(
+            self.provenance_secret,
+            trusted_builders={"trusted-ci"},
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -192,7 +212,11 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
         return proposal.proposal_id
 
     def service(self, coordinator=None) -> ReleaseExecutionService:
-        return ReleaseExecutionService(coordinator or self.coordinator, self.adapter)
+        return ReleaseExecutionService(
+            coordinator or self.coordinator,
+            self.adapter,
+            provenance_verifier=self.provenance_verifier,
+        )
 
     def test_approved_proposal_is_deployed_before_local_registry_activation(self) -> None:
         registry = self.registry()
@@ -204,6 +228,7 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
             self.service(),
             target_id="catalog-service",
             owner_id="release-controller",
+            attestation=self.attestation,
             ttl_seconds=30,
         )
 
@@ -231,6 +256,7 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
                 failing_service,
                 target_id="catalog-service",
                 owner_id="release-controller",
+                attestation=self.attestation,
                 ttl_seconds=30,
             )
 
@@ -248,12 +274,14 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
         self.assertEqual(ProposalStatus.ACTIVATING, recovered.status)
         self.assertEqual("catalog-service", recovered.release_target_id)
         self.assertEqual(0, recovered.release_expected_generation)
+        self.assertEqual(self.attestation, recovered.release_attestation)
 
         active = restarted_engine.activate_with_release(
             proposal_id,
             self.service(),
             target_id="catalog-service",
             owner_id="release-controller",
+            attestation=self.attestation,
             ttl_seconds=30,
         )
 
@@ -281,6 +309,7 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
                 self.service(),
                 target_id="catalog-service",
                 owner_id="release-controller",
+                attestation=self.attestation,
                 ttl_seconds=30,
             )
         registry.replace = original_replace
@@ -296,11 +325,32 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
             self.service(),
             target_id="catalog-service",
             owner_id="release-controller",
+            attestation=self.attestation,
             ttl_seconds=30,
         )
         self.assertEqual(ProposalStatus.ACTIVE, active.status)
         self.assertEqual(1, self.adapter.calls)
         self.assertEqual(self.candidate.handler, restarted_registry.resolve("catalog_lookup").handler)
+
+    def test_invalid_attestation_does_not_start_release_activation(self) -> None:
+        registry = self.registry()
+        engine = self.new_engine(registry)
+        proposal_id = self.approved_proposal(engine)
+        invalid = replace(self.attestation, signature="0" * 64)
+
+        with self.assertRaises(ArtifactProvenanceError):
+            engine.activate_with_release(
+                proposal_id,
+                self.service(),
+                target_id="catalog-service",
+                owner_id="release-controller",
+                attestation=invalid,
+                ttl_seconds=30,
+            )
+
+        self.assertEqual(ProposalStatus.APPROVED, engine.get(proposal_id).status)
+        self.assertEqual(0, self.coordinator.get("catalog-service").generation)
+        self.assertEqual(0, self.adapter.calls)
 
     def test_release_aware_proposal_rejects_local_only_rollback(self) -> None:
         registry = self.registry()
@@ -311,6 +361,7 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
             self.service(),
             target_id="catalog-service",
             owner_id="release-controller",
+            attestation=self.attestation,
             ttl_seconds=30,
         )
         self.assertEqual(ProposalStatus.ACTIVE, active.status)
@@ -334,6 +385,7 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
                 service,
                 target_id="catalog-service",
                 owner_id="release-controller",
+                attestation=self.attestation,
                 ttl_seconds=30,
             )
 
@@ -343,6 +395,7 @@ class ReleaseAwareEvolutionTests(unittest.TestCase):
                 self.service(),
                 target_id="other-target",
                 owner_id="release-controller",
+                attestation=self.attestation,
                 ttl_seconds=30,
             )
         self.assertEqual(1, self.adapter.calls)
